@@ -15,6 +15,7 @@ communication is local USB Serial.
 AppleMACled.ino     ESP32-S3 LED firmware
 firmware/           Prebuilt complete 4 MB flash image
 MacAgent/           macOS agent, installer, uninstaller, and diagnostics
+*.gif               Lighting-effect previews used by this README
 README.md           Installation and wiring guide
 ```
 
@@ -29,6 +30,35 @@ Lighting events include:
 - Trash emptying notification;
 - Wi-Fi and Bluetooth connection notification;
 - system-audio-reactive music visualization.
+
+## Lighting previews
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <strong>Wi-Fi and Bluetooth</strong><br>
+      <img src="wifi.gif" alt="Wi-Fi and Bluetooth connection lighting" width="360"><br>
+      <sub>Connected Wi-Fi network or Bluetooth device</sub>
+    </td>
+    <td align="center" width="50%">
+      <strong>Music visualization</strong><br>
+      <img src="music.gif" alt="System-audio-reactive music visualization" width="360"><br>
+      <sub>System-audio-reactive lighting</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <strong>Transfers and file copies</strong><br>
+      <img src="air.gif" alt="Safari download, AirDrop, and file-copy lighting" width="360"><br>
+      <sub>Safari downloads, AirDrop, or file-copy activity</sub>
+    </td>
+    <td align="center" width="50%">
+      <strong>ChatGPT</strong><br>
+      <img src="chatgpt.gif" alt="ChatGPT web and macOS app lighting" width="360"><br>
+      <sub>ChatGPT on the web or in the macOS app</sub>
+    </td>
+  </tr>
+</table>
 
 ## Hardware
 
