@@ -377,3 +377,7 @@ COLOR_FADE_MS
 
 Individual animation timings and colors are also defined as constants in the
 firmware and can be adjusted before compiling.
+
+## License
+
+AppleMAC-LED is released under the [MIT License](LICENSE).
