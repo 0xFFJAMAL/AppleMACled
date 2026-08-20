@@ -1,13 +1,21 @@
 .DS_Store
-__MACOSX/
 __pycache__/
 *.py[cod]
+*.log
+.esp32-usb-venv/
+.venv/
+venv/
+*.app/
+.idea/
+.vscode/
+build/
 *.bin
 *.elf
-*.hex
 *.map
 *.uf2
-build/
-build-*/
-.arduinoIDE/
-.vscode/
+*.partitions.bin
+*.bootloader.bin
+
+# Publish only the complete, verified 4 MB flash image.
+!firmware/
+!firmware/AppleMACled_4MB_merged.bin

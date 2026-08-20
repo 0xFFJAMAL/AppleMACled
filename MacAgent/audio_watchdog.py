@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -28,15 +29,12 @@ TRANSIENT_FAILURE_MARKERS = (
     "audio unavailable",
     "audio output failed",
     "audio start failed",
-    "не удалось найти дисплеи",
     "no display",
 )
 PERMANENT_FAILURE_MARKERS = (
     "not authorized",
     "permission denied",
     "requires macos",
-    "не разреш",
-    "нет разреш",
 )
 
 
@@ -78,7 +76,7 @@ def read_audio_health() -> tuple[bool, bool, str]:
     except FileNotFoundError:
         return False, False, "native-audio-state.json is missing"
     except Exception as exc:
-        return False, False, f"failed to read audio state: {exc}"
+        return False, False, f"audio state read error: {exc}"
 
 
 def restart_main_agent() -> bool:
@@ -86,17 +84,17 @@ def restart_main_agent() -> bool:
     try:
         result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=20)
         if result.returncode == 0:
-            log("ScreenCaptureKit did not recover; the main AppleMAC-LED agent was restarted.")
+            log("ScreenCaptureKit did not recover; restarted the main AppleMAC-LED agent.")
             return True
         detail = (result.stderr or result.stdout or "unknown launchctl error").strip()
-        log(f"Failed to restart the agent: {detail}")
+        log(f"Could not restart the agent: {detail}")
     except Exception as exc:
-        log(f"launchctl kickstart failed: {exc}")
+        log(f"launchctl kickstart error: {exc}")
     return False
 
 
 def main() -> int:
-    log("Audio watchdog 36.1 started.")
+    log("Audio watchdog public 1.0 started.")
     time.sleep(START_GRACE_SECONDS)
 
     consecutive_failures = 0

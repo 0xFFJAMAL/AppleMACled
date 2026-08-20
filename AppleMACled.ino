@@ -1,20 +1,24 @@
 /*
-  AppleMAC-LED — ESP32-S3 + WS2812B status lighting
+  AppleMAC-LED USB Serial — ESP32-S3 + WS2812B
+  LED data: GPIO21
+  LED count: 20
 
-  Hardware:
-  - WS2812B data: GPIO21
-  - 20 LEDs by default
-  - Mac <-> ESP32-S3 transport: USB Serial at 115200 baud
-  - Required hardware self-reset: GPIO16 drives an external N-MOSFET that pulls EN/RST low
-
-  This public firmware contains only the LED/status-light functionality.
+  The Mac and ESP32-S3 communicate only through USB Serial at 115200 baud.
+  The macOS agent sends lighting commands and the system-audio level used by
+  the music overlay. The firmware does not use Wi-Fi or Bluetooth.
 
   Protocol:
-    Mac -> ESP: CMD:<COMMAND>\n
-    ESP -> Mac: RSP:<RESPONSE>\n
-  The macOS agent drives the status effects over USB Serial. Wi-Fi, BLE and Arduino OTA
-  are disabled on the ESP32-S3 itself.
+  Mac -> ESP: CMD:<COMMAND>\n
+  ESP -> Mac: RSP:<RESPONSE>\n
 
+  At startup the ESP shows the white recovery animation and waits for the USB
+  agent. The agent sends WAIT and then OK after the link is established.
+
+  USB CDC configuration depends on the board connection:
+  - external USB-UART (CH343/CH9102/CP210x): USB CDC On Boot disabled;
+  - native ESP32-S3 USB: USB CDC On Boot enabled.
+
+  The GPIO16 hardware self-reset circuit is required for USB recovery.
   Requires the FastLED library.
 */
 
@@ -23,6 +27,7 @@
 #include <esp_idf_version.h>
 #include <esp_system.h>
 #include <esp_attr.h>
+#include <math.h>
 #include <Preferences.h>
 
 #if defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE && \
@@ -33,37 +38,24 @@
   #define APPLEMACLED_NATIVE_HWCDC 0
 #endif
 
-
-
 #define LED_PIN       21
 #define LED_COUNT     20
 #define LED_TYPE      WS2812B
 #define COLOR_ORDER   GRB
 #define FRAME_MS      20
 
-
-
 constexpr uint32_t LOOP_WATCHDOG_TIMEOUT_MS = 10000UL;
 
 CRGB leds[LED_COUNT];
-
 
 constexpr uint8_t  MAX_BRIGHTNESS  = 250;
 constexpr uint8_t  MIN_BRIGHTNESS  = 0;
 constexpr uint32_t PULSE_PERIOD_MS = 10000UL;
 constexpr uint32_t COLOR_HOLD_MS   = 300000UL;
 constexpr uint32_t COLOR_FADE_MS   = 15000UL;
-
-
 constexpr uint16_t DOWNLOAD_SNAKE_STEP_MS = 45;
 constexpr uint8_t  DOWNLOAD_SNAKE_TAIL    = 10;
-
-
-
 constexpr uint32_t SNAKE_COMMAND_TIMEOUT_MS = 12000UL;
-
-
-
 constexpr uint16_t COPY_SNAKE_STEP_MS       = 40;
 constexpr uint8_t  COPY_SNAKE_TAIL          = 10;
 constexpr uint16_t COPY_SNAKE_PAUSE_MS      = 100;
@@ -71,8 +63,6 @@ constexpr uint8_t  COPY_BACKGROUND_LEVEL    = 30;
 constexpr uint8_t  COPY_HEAD_BRIGHTNESS     = 255;
 constexpr uint8_t  COPY_TAIL_MIN_BRIGHTNESS = 22;
 const CRGB COPY_SNAKE_COLOR = CRGB(135, 255, 45);
-
-
 constexpr uint16_t CHATGPT_SNAKE_STEP_MS       = 38;
 constexpr uint8_t  CHATGPT_SNAKE_TAIL          = 10;
 constexpr uint16_t CHATGPT_SNAKE_PAUSE_MS      = 100;
@@ -80,26 +70,16 @@ constexpr uint8_t  CHATGPT_BACKGROUND_LEVEL    = 34;
 constexpr uint8_t  CHATGPT_HEAD_BRIGHTNESS     = 255;
 constexpr uint8_t  CHATGPT_TAIL_MIN_BRIGHTNESS = 24;
 const CRGB CHATGPT_SNAKE_COLOR = CRGB(255, 105, 0);
-
-
-
 constexpr uint16_t APPSTORE_SNAKE_STEP_MS       = 40;
 constexpr uint8_t  APPSTORE_SNAKE_TAIL          = 10;
 constexpr uint16_t APPSTORE_SNAKE_PAUSE_MS      = 100;
 constexpr uint8_t  APPSTORE_BACKGROUND_LEVEL    = 24;
 constexpr uint8_t  APPSTORE_HEAD_BRIGHTNESS     = 255;
 constexpr uint8_t  APPSTORE_TAIL_MIN_BRIGHTNESS = 22;
-
-
-
 constexpr uint8_t  TRASH_FLASH_COUNT  = 3;
 constexpr uint16_t TRASH_FLASH_ON_MS  = 220;
 constexpr uint16_t TRASH_FLASH_OFF_MS = 160;
 const CRGB TRASH_FLASH_COLOR = CRGB(255, 0, 0);
-
-
-
-
 constexpr uint16_t SYSTEM_BLUE_SNAKE_STEP_MS        = 38;
 constexpr uint8_t  SYSTEM_BLUE_SNAKE_TAIL           = 10;
 constexpr uint8_t  SYSTEM_BLUE_BACKGROUND_LEVEL     = 24;
@@ -110,9 +90,6 @@ constexpr uint8_t  SYSTEM_BLUE_FLASH_COUNT          = 0;
 constexpr uint16_t SYSTEM_BLUE_FLASH_ON_MS           = 220;
 constexpr uint16_t SYSTEM_BLUE_FLASH_OFF_MS          = 160;
 const CRGB SYSTEM_BLUE_COLOR = CRGB(0, 105, 255);
-
-
-
 constexpr uint32_t AUDIO_PACKET_TIMEOUT_MS = 1200UL;
 constexpr uint16_t AUDIO_BEAT_FLASH_MS = 125;
 constexpr uint8_t  AUDIO_MIN_VISIBLE_LEVEL = 7;
@@ -122,80 +99,37 @@ constexpr uint8_t  AUDIO_FLICKER_PEAK_GATE = 58;
 constexpr uint8_t  AUDIO_FLICKER_LEVEL_RANGE = 210;
 constexpr uint8_t  AUDIO_FLICKER_PEAK_RANGE = 60;
 constexpr uint8_t  AUDIO_FLICKER_BEAT_BOOST = 50;
-
-
 constexpr uint8_t  WAIT_BACKGROUND_BRIGHTNESS = 28;
 constexpr uint8_t  WAIT_HEAD_BRIGHTNESS       = 250;
 constexpr uint16_t WAIT_SNAKE_STEP_MS          = 65;
 constexpr uint8_t  WAIT_SNAKE_TAIL             = 10;
 constexpr uint8_t  WAIT_PULSE_MIN_BRIGHTNESS   = 10;
 constexpr uint8_t  WAIT_PULSE_MAX_BRIGHTNESS   = 175;
-
-
 constexpr uint32_t RESULT_PULSE_MS = 2400UL;
-
-// -------------------- USB SERIAL / AUDIO --------------------
-
 constexpr uint32_t USB_SERIAL_BAUD = 115200;
 constexpr size_t USB_COMMAND_MAX = 4096;
-
-
-
 constexpr size_t USB_CDC_RX_BUFFER_SIZE = 4096;
 constexpr size_t USB_CDC_TX_BUFFER_SIZE = 1024;
 constexpr uint32_t USB_CDC_TX_TIMEOUT_MS = 35UL;
-
-
-
-
-
 constexpr uint32_t USB_BUS_RESET_CONFIRM_MS = 18000UL;
-
-
-
-
-
-
-//   Source -> GND
-
-
 constexpr uint8_t SELF_RESET_PIN = 16;
 constexpr uint8_t SELF_RESET_ACTIVE_LEVEL = HIGH;
 constexpr uint8_t SELF_RESET_IDLE_LEVEL = LOW;
 constexpr uint32_t SELF_RESET_FALLBACK_MS = 600UL;
-
-
-//
-
-
-//
-
-
-
-
-//
-
-
-
 constexpr uint32_t USB_RECOVERY_POLL_MS = 250UL;
 constexpr uint32_t USB_RECOVERY_INITIAL_GRACE_MS = 15000UL;
 constexpr uint32_t USB_RECOVERY_LOOP_PULSE_MS = 18000UL;
 constexpr uint32_t USB_RECOVERY_LOOP_SNAKE_MS =
   static_cast<uint32_t>(LED_COUNT) * WAIT_SNAKE_STEP_MS;
 constexpr uint32_t USB_RECOVERY_RESET_ARM_DELAY_MS = 250UL;
-
 constexpr char USB_RECOVERY_NVS_NAMESPACE[] = "amled_usbrec";
 constexpr char USB_RECOVERY_NVS_PENDING_KEY[] = "pending";
-
 char usbCommandBuffer[USB_COMMAND_MAX];
 size_t usbCommandLength = 0;
 bool usbHostSeen = false;
 bool usbEverConnected = false;
 uint32_t usbLastActivityAt = 0;
 String usbLastStatus = "BOOTING";
-
-
-
 volatile bool usbCdcBusResetEventPending = false;
 volatile bool usbCdcTrafficEventPending = false;
 bool usbCdcPhysicalPlugged = false;
@@ -209,25 +143,15 @@ uint32_t usbRecoveryCycleStartedAt = 0;
 uint32_t usbRecoveryLastActionAt = 0;
 uint32_t usbRecoveryLastPollAt = 0;
 uint8_t usbRecoverySoftReinitCount = 0;
-
-
-
-
-
 Preferences usbRecoveryPreferences;
 bool usbRecoveryPreferencesReady = false;
 bool usbRecoveryLoopActive = false;
 esp_reset_reason_t startupResetReason = ESP_RST_UNKNOWN;
-
 bool loopWatchdogActive = false;
-
-constexpr bool otaBusy = false;
-
 bool restartPending = false;
 bool restartPendingIsUsbRecovery = false;
 bool restartPendingUseHardwareReset = false;
 uint32_t restartAt = 0;
-
 uint8_t audioLevel = 0;
 uint8_t audioPeak = 0;
 uint32_t audioLastPacketAt = 0;
@@ -235,13 +159,6 @@ uint32_t audioBeatUntil = 0;
 uint32_t audioLastSequence = 0;
 bool audioSequenceInitialized = false;
 bool audioStreamActive = false;
-
-// -------------------- USB SERIAL PROTOCOL --------------------
-
-
-
-
-
 
 const CRGB palette[] = {
   CRGB(255, 255, 255),
@@ -256,8 +173,6 @@ const CRGB palette[] = {
 };
 
 constexpr uint8_t COLOR_COUNT = sizeof(palette) / sizeof(palette[0]);
-
-
 
 enum AnimationMode : uint8_t {
   MODE_WAITING_FOR_MAC,
@@ -291,8 +206,6 @@ volatile bool systemBlueSequenceActive = false;
 volatile uint8_t systemBluePendingCount = 0;
 volatile uint32_t systemBlueSequenceStartedAt = 0;
 
-
-
 void feedLoopWatchdog();
 
 void scheduleRestart(
@@ -307,8 +220,6 @@ void scheduleRestart(
 }
 
 void setupSelfResetHardware() {
-
-
   digitalWrite(SELF_RESET_PIN, SELF_RESET_IDLE_LEVEL);
   pinMode(SELF_RESET_PIN, OUTPUT);
   digitalWrite(SELF_RESET_PIN, SELF_RESET_IDLE_LEVEL);
@@ -321,9 +232,6 @@ void initializeUsbRecoveryPersistentState() {
   );
 
   if (!usbRecoveryPreferencesReady) {
-
-
-
     usbRecoveryLoopActive = false;
     return;
   }
@@ -332,7 +240,6 @@ void initializeUsbRecoveryPersistentState() {
     USB_RECOVERY_NVS_PENDING_KEY,
     false
   );
-
 
   if (usbRecoveryPreferences.isKey("attempt")) {
     usbRecoveryPreferences.remove("attempt");
@@ -351,19 +258,11 @@ void setUsbRecoveryLoopActive(bool active) {
 }
 
 void clearUsbRecoveryPersistentState() {
-
-
   setUsbRecoveryLoopActive(false);
 }
 
 bool prepareUsbRecoveryHardwareReset() {
-
-
-
   setUsbRecoveryLoopActive(true);
-
-
-
   delay(35);
   return true;
 }
@@ -372,17 +271,10 @@ bool performHardwareSelfReset(bool usbRecoveryReset) {
   if (usbRecoveryReset) {
     prepareUsbRecoveryHardwareReset();
   } else {
-
     clearUsbRecoveryPersistentState();
   }
-
-
-
   digitalWrite(SELF_RESET_PIN, SELF_RESET_ACTIVE_LEVEL);
   delay(SELF_RESET_FALLBACK_MS);
-
-
-
   digitalWrite(SELF_RESET_PIN, SELF_RESET_IDLE_LEVEL);
   delay(20);
   ESP.restart();
@@ -408,9 +300,6 @@ void setupLoopWatchdog() {
   watchdogConfig.timeout_ms = LOOP_WATCHDOG_TIMEOUT_MS;
   watchdogConfig.idle_core_mask = 0;
   watchdogConfig.trigger_panic = true;
-
-
-
   configResult = esp_task_wdt_reconfigure(&watchdogConfig);
   if (configResult == ESP_ERR_INVALID_STATE) {
     configResult = esp_task_wdt_init(&watchdogConfig);
@@ -421,7 +310,6 @@ void setupLoopWatchdog() {
     true
   );
   if (configResult == ESP_ERR_INVALID_STATE) {
-
     configResult = ESP_OK;
   }
 #endif
@@ -433,8 +321,6 @@ void setupLoopWatchdog() {
 
   const esp_err_t addResult = esp_task_wdt_add(nullptr);
   if (addResult == ESP_OK || addResult == ESP_ERR_INVALID_ARG) {
-
-
     loopWatchdogActive = true;
     esp_task_wdt_reset();
     Serial.printf(
@@ -450,11 +336,6 @@ void sendUsbResponse(const String& status) {
   usbLastStatus = status;
   Serial.print("RSP:");
   Serial.println(status);
-}
-
-
-void setBleStatus(const String& status) {
-  sendUsbResponse(status);
 }
 
 const char* decisionName() {
@@ -597,7 +478,7 @@ void applyAudioOverlay(uint32_t now) {
 
 String buildUsbStatus() {
   String status = usbHostSeen ? "USB:CONNECTED" : "USB:WAITING";
-  status += "|FW:36.14";
+  status += "|FW:PUBLIC_1.0";
 
   status += "|DECISION:";
   status += decisionName();
@@ -656,8 +537,6 @@ void triggerDecision(NetworkDecision decision) {
   animationMode = MODE_RESULT_PULSE;
 }
 
-
-
 uint32_t waitModeStartedAt = 0;
 uint32_t waitLastFrameAt = 0;
 int32_t waitSnakeHead = 0;
@@ -672,14 +551,11 @@ void enterWaitingMode() {
   copySnakeHeartbeatAt = 0;
   chatgptSnakeHeartbeatAt = 0;
   appStoreSnakeHeartbeatAt = 0;
-
   const uint32_t now = millis();
   waitModeStartedAt = now;
   waitSnakeHead = 0;
   waitLastFrameAt = 0;
   animationMode = MODE_WAITING_FOR_MAC;
-
-
   CRGB background = CRGB::White;
   background.nscale8_video(WAIT_BACKGROUND_BRIGHTNESS);
   fill_solid(leds, LED_COUNT, background);
@@ -687,20 +563,12 @@ void enterWaitingMode() {
 }
 
 void updateWaitingAnimation() {
-  if (otaBusy) {
-    return;
-  }
-
   const uint32_t now = millis();
   if (now - waitLastFrameAt < FRAME_MS) {
     return;
   }
   waitLastFrameAt = now;
-
   const uint32_t elapsed = now - waitModeStartedAt;
-
-
-
   if (!usbRecoveryLoopActive) {
     const float progress = min(
       1.0f,
@@ -720,8 +588,6 @@ void updateWaitingAnimation() {
     return;
   }
 
-
-
   if (elapsed < USB_RECOVERY_LOOP_PULSE_MS) {
     const float progress =
       static_cast<float>(elapsed) /
@@ -731,15 +597,12 @@ void updateWaitingAnimation() {
       WAIT_PULSE_MIN_BRIGHTNESS +
       wave * (WAIT_PULSE_MAX_BRIGHTNESS - WAIT_PULSE_MIN_BRIGHTNESS)
     );
-
     CRGB white = CRGB::White;
     white.nscale8_video(brightness);
     fill_solid(leds, LED_COUNT, white);
     FastLED.show();
     return;
   }
-
-
 
   const uint32_t snakeElapsed = elapsed - USB_RECOVERY_LOOP_PULSE_MS;
   const uint32_t rawStep = snakeElapsed / WAIT_SNAKE_STEP_MS;
@@ -777,13 +640,7 @@ void updateWaitingAnimation() {
   FastLED.show();
 }
 
-
-
 void updateResultPulse() {
-  if (otaBusy) {
-    return;
-  }
-
   const uint32_t now = millis();
   const uint32_t elapsed = now - resultPulseStartedAt;
 
@@ -802,8 +659,6 @@ void updateResultPulse() {
   fill_solid(leds, LED_COUNT, output);
   FastLED.show();
 }
-
-
 
 uint8_t currentColorIndex = 0;
 uint8_t nextColorIndex = 1;
@@ -829,8 +684,6 @@ uint32_t appStoreSnakePauseUntil = 0;
 bool appStoreSnakePaused = false;
 
 void resetNormalAnimation() {
-
-
   currentColorIndex = COLOR_COUNT > 1
     ? 1 + static_cast<uint8_t>(esp_random() % (COLOR_COUNT - 1))
     : 0;
@@ -968,14 +821,9 @@ void advanceCopySnake(uint32_t now) {
 
 void renderCopySnake(const CRGB& baseColor) {
   (void)baseColor;
-
-
-
   CRGB background = COPY_SNAKE_COLOR;
   background.nscale8_video(COPY_BACKGROUND_LEVEL);
   fill_solid(leds, LED_COUNT, background);
-
-
   if (copySnakePaused) {
     return;
   }
@@ -1142,8 +990,6 @@ void startSystemBlueSequence() {
 }
 
 void queueSystemBlueSequence() {
-
-
   if (trashFlashActive || systemBlueSequenceActive) {
     if (systemBluePendingCount < 4) {
       systemBluePendingCount++;
@@ -1154,8 +1000,6 @@ void queueSystemBlueSequence() {
 }
 
 void triggerTrashFlash() {
-
-
   if (systemBlueSequenceActive) {
     systemBlueSequenceActive = false;
     if (systemBluePendingCount < 4) {
@@ -1166,10 +1010,8 @@ void triggerTrashFlash() {
   trashFlashActive = true;
 }
 
-
-
 bool updateTrashFlashOverlay() {
-  if (!trashFlashActive || otaBusy) {
+  if (!trashFlashActive) {
     return false;
   }
 
@@ -1194,10 +1036,8 @@ bool updateTrashFlashOverlay() {
   return true;
 }
 
-
-
 bool updateSystemBlueOverlay() {
-  if (otaBusy || trashFlashActive) {
+  if (trashFlashActive) {
     return false;
   }
 
@@ -1282,18 +1122,11 @@ bool updateSystemBlueOverlay() {
 }
 
 void updateNormalAnimation() {
-  if (otaBusy) {
-    return;
-  }
-
   const uint32_t now = millis();
   if (now - normalLastFrameAt < FRAME_MS) {
     return;
   }
   normalLastFrameAt = now;
-
-
-
   if (
     appStoreSnakeRequested &&
     now - appStoreSnakeHeartbeatAt >= SNAKE_COMMAND_TIMEOUT_MS
@@ -1352,7 +1185,6 @@ void updateNormalAnimation() {
   FastLED.show();
 }
 
-// -------------------- USB SERIAL COMMANDS --------------------
 
 void processUsbCommand(String command) {
   command.trim();
@@ -1363,8 +1195,6 @@ void processUsbCommand(String command) {
     command.trim();
   }
   if (command.isEmpty()) return;
-
-
 
   if (usbCdcBusResetSuspected) {
     usbCdcBusResetSuspected = false;
@@ -1380,8 +1210,6 @@ void processUsbCommand(String command) {
   usbRecoveryLastActionAt = 0;
   usbRecoverySoftReinitCount = 0;
 
-
-
   clearUsbRecoveryPersistentState();
   if (restartPending && restartPendingIsUsbRecovery) {
     restartPending = false;
@@ -1392,8 +1220,6 @@ void processUsbCommand(String command) {
   usbCdcPhysicalPlugged = Serial.isPlugged();
   usbCdcConnected = true;
 #endif
-
-
 
   if (command.startsWith("AUDIO:")) {
     updateAudioFromUsbCommand(command);
@@ -1556,8 +1382,6 @@ void processUsbSerial() {
   }
 }
 
-// -------------------- USB CDC AUTO-RECOVERY --------------------
-
 #if APPLEMACLED_NATIVE_HWCDC
 static void usbCdcEventCallback(
   void* arg,
@@ -1575,7 +1399,6 @@ static void usbCdcEventCallback(
     eventId == ARDUINO_HW_CDC_CONNECTED_EVENT ||
     eventId == ARDUINO_HW_CDC_RX_EVENT
   ) {
-
     usbCdcTrafficEventPending = true;
   }
 }
@@ -1584,16 +1407,11 @@ static void usbCdcEventCallback(
 void initializeUsbSerialTransport(bool forceReenumeration) {
 #if APPLEMACLED_NATIVE_HWCDC
   if (forceReenumeration) {
-
-
     Serial.flush();
     Serial.end();
     feedLoopWatchdog();
     delay(160);
   }
-
-
-
 
   Serial.setRxBufferSize(USB_CDC_RX_BUFFER_SIZE);
   Serial.setTxBufferSize(USB_CDC_TX_BUFFER_SIZE);
@@ -1678,7 +1496,6 @@ void processUsbRecovery() {
     usbCdcConnected = connected;
   }
 
-
   if (usbCdcPhysicalPlugged != plugged) {
     usbCdcPhysicalPlugged = plugged;
     usbCdcConnected = connected;
@@ -1686,9 +1503,6 @@ void processUsbRecovery() {
     usbCdcBusResetSuspectedAt = 0;
     beginUsbRecoveryCycle(now);
   }
-
-
-
 
   if (
     usbCdcBusResetSuspected &&
@@ -1701,16 +1515,11 @@ void processUsbRecovery() {
     beginUsbRecoveryCycle(suspectedAt);
   }
 
-
-
   if (!usbRecoveryAwaitingHandshake) return;
 
   if (usbRecoveryCycleStartedAt == 0) {
     usbRecoveryCycleStartedAt = now;
   }
-
-
-
 
   (void)plugged;
 
@@ -1723,35 +1532,26 @@ void processUsbRecovery() {
     cycleElapsed >= restartDelay &&
     !restartPending
   ) {
-
-
     scheduleRestart(USB_RECOVERY_RESET_ARM_DELAY_MS, true, true);
   }
 #endif
 }
 
-// -------------------- SETUP / LOOP --------------------
+
 
 void setup() {
-
   setupSelfResetHardware();
-
   startupResetReason = esp_reset_reason();
   initializeUsbRecoveryPersistentState();
-
   initializeUsbSerialTransport(false);
   delay(300);
-
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, LED_COUNT)
          .setCorrection(TypicalLEDStrip);
   FastLED.setBrightness(255);
   FastLED.clear(true);
-
   resetNormalAnimation();
   enterWaitingMode();
-
   setupLoopWatchdog();
-
   Serial.println();
   Serial.printf(
     "Reset reason: %s (%d)\n",
@@ -1762,10 +1562,8 @@ void setup() {
     "USB continuous recovery cycle: %s\n",
     usbRecoveryLoopActive ? "PULSE_SNAKE" : "INITIAL"
   );
-  Serial.println("AppleMAC-LED 36.14 lighting-only firmware started");
+  Serial.println("AppleMAC-LED public firmware 1.0 started");
   Serial.println("USB Serial transport: active, 115200 baud");
-  Serial.println("BLE: disabled");
-  Serial.println("Wi-Fi/OTA: disabled");
   Serial.println("Waiting for USB agent WAIT/OK");
   sendUsbResponse("BOOT:APPLEMAC_LED_USB:1:GPIO16_SELF_RESET=1:CONTINUOUS=1");
 }
@@ -1815,8 +1613,6 @@ void loop() {
         return;
       }
     }
-
-
 
     restartPending = false;
     restartPendingIsUsbRecovery = false;

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
-SOURCE_RUNNER="$SOURCE_DIR/applemacled.command"
+SOURCE_RUNNER="$SOURCE_DIR/send_usb_to_esp.command"
 SOURCE_PYTHON="$SOURCE_DIR/esp32_usb_serial.py"
 
 APP_SUPPORT="$HOME/Library/Application Support/AppleMAC-LED"
@@ -16,21 +16,19 @@ LAUNCH_DIR="$HOME/Library/LaunchAgents"
 LAUNCH_PLIST="$LAUNCH_DIR/com.applemacled.agent.plist"
 LOG_DIR="$HOME/Library/Logs/AppleMAC-LED"
 LABEL="com.applemacled.agent"
-LEGACY_LABEL="com.applemacled.ble-agent"
-LEGACY_PLIST="$LAUNCH_DIR/$LEGACY_LABEL.plist"
 UID_VALUE="$(id -u)"
 NATIVE_STATE="$APP_SUPPORT/native-ui-state.json"
 NATIVE_AUDIO_STATE="$APP_SUPPORT/native-audio-state.json"
 
 if [[ ! -f "$SOURCE_RUNNER" || ! -f "$SOURCE_PYTHON" ]]; then
-  echo "Error: the following files must be located next to install.command:"
-  echo "  applemacled.command"
+  echo "Error: these files must be next to install.command:"
+  echo "  send_usb_to_esp.command"
   echo "  esp32_usb_serial.py"
   exit 1
 fi
 
 if [[ ! -x /usr/bin/clang ]]; then
-  echo "clang was not found. Install Apple command-line tools with:"
+  echo "clang was not found. Install Apple Command Line Tools with:"
   echo "  xcode-select --install"
   exit 1
 fi
@@ -38,18 +36,15 @@ fi
 stop_old_agent() {
   launchctl bootout "gui/$UID_VALUE/$LABEL" >/dev/null 2>&1 || true
   launchctl bootout "gui/$UID_VALUE" "$LAUNCH_PLIST" >/dev/null 2>&1 || true
-  launchctl bootout "gui/$UID_VALUE/$LEGACY_LABEL" >/dev/null 2>&1 || true
-  launchctl bootout "gui/$UID_VALUE" "$LEGACY_PLIST" >/dev/null 2>&1 || true
-  rm -f "$LEGACY_PLIST"
   pkill -f "esp32_usb_serial.*daemon" >/dev/null 2>&1 || true
   pkill -f "AppleMACLEDAgent" >/dev/null 2>&1 || true
 }
 
-echo "Stopping the previous agent version…"
+echo "Stopping the previous agent…"
 stop_old_agent
 sleep 1
 
-echo "Installing the native AppleMACLED Agent…"
+echo "Building AppleMACLED Agent public 1.0…"
 mkdir -p \
   "$APP_SUPPORT" \
   "$APP_BUNDLE/Contents/MacOS" \
@@ -58,15 +53,15 @@ mkdir -p \
   "$LOG_DIR"
 chmod 700 "$APP_SUPPORT"
 
-cp "$SOURCE_RUNNER" "$APP_SUPPORT/applemacled.command"
+cp "$SOURCE_RUNNER" "$APP_SUPPORT/send_usb_to_esp.command"
 cp "$SOURCE_PYTHON" "$APP_SUPPORT/esp32_usb_serial.py"
-chmod +x "$APP_SUPPORT/applemacled.command"
+chmod +x "$APP_SUPPORT/send_usb_to_esp.command"
 rm -f "$NATIVE_STATE" "$NATIVE_AUDIO_STATE"
 
 cat > "$RUN_AGENT" <<AGENT
 #!/bin/zsh
 export PYTHONUNBUFFERED=1
-exec "$APP_SUPPORT/applemacled.command" daemon \
+exec "$APP_SUPPORT/send_usb_to_esp.command" daemon \
   --interval 15 \
   --copy-poll-interval 0.10 \
   >> "$LOG_DIR/agent.log" \
@@ -94,33 +89,33 @@ cat > "$INFO_PLIST" <<'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>36.14</string>
+  <string>1.0</string>
   <key>CFBundleVersion</key>
-  <string>36.14.0</string>
+  <string>1.0.0</string>
   <key>LSUIElement</key>
   <true/>
 
   <key>NSBluetoothAlwaysUsageDescription</key>
-  <string>Bluetooth is used only to detect connected-device events for AppleMAC-LED lighting.</string>
+  <string>Bluetooth access detects newly connected devices for the blue lighting notification.</string>
   <key>NSBluetoothPeripheralUsageDescription</key>
-  <string>Bluetooth is used only for connected-device lighting events.</string>
-  <key>NSLocationWhenInUseUsageDescription</key>
-  <string>Location may be requested by macOS while reading Wi-Fi connection information.</string>
+  <string>Bluetooth access detects newly connected devices for the blue lighting notification.</string>
   <key>NSDownloadsFolderUsageDescription</key>
-  <string>Downloads access is used only to detect active Safari downloads.</string>
+  <string>Downloads folder access is used only to detect active Safari downloads.</string>
   <key>NSScreenCaptureDescription</key>
-  <string>Screen and system-audio access is used only for the optional audio-reactive LED effect.</string>
+  <string>Screen and system-audio recording access is used only to measure audio levels for the music-reactive LEDs. No screen image is stored.</string>
 </dict>
 </plist>
 PLIST
 
-
-
+# The native process uses Accessibility for Finder, Safari, and App Store.
+# ChatGPT/Codex is detected from its process and lifecycle files without
+# traversing its accessibility tree.
 SOURCE_FILE="$(mktemp -t applemacled-native-launcher).m"
 cat > "$SOURCE_FILE" <<SRC
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <IOBluetooth/IOBluetooth.h>
+#import <CoreBluetooth/CoreBluetooth.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreMedia/CoreMedia.h>
 #import <AudioToolbox/AudioToolbox.h>
@@ -142,6 +137,15 @@ static volatile sig_atomic_t child_pid = -1;
 static const unsigned int NativeUiScanTimeoutSeconds = 25;
 static NSString *const StatePath = @"$NATIVE_STATE";
 static NSString *const AudioStatePath = @"$NATIVE_AUDIO_STATE";
+static NSString *PermissionStage = @"ready";
+static BOOL DownloadsAccessChecked = NO;
+static BOOL DownloadsAccessGranted = NO;
+static CBCentralManager *PermissionBluetoothManager = nil;
+
+static BOOL PermissionStageIs(NSString *stage) {
+    return [PermissionStage isEqualToString:@"ready"]
+        || [PermissionStage isEqualToString:stage];
+}
 
 static uint64_t BluetoothConnectEventCounter = 0;
 static NSString *BluetoothLastDeviceName = nil;
@@ -191,6 +195,7 @@ static void WriteAudioState(BOOL active, double level, double peak, BOOL beat, N
     if (json == nil || jsonError != nil) return;
     [json writeToFile:AudioStatePath options:NSDataWritingAtomic error:nil];
 }
+
 
 @interface AppleMACLEDAudioMeter : NSObject <SCStreamOutput, SCStreamDelegate> {
     SCStream *_stream;
@@ -619,10 +624,9 @@ static NSString *ElementText(AXUIElementRef element) {
         stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 }
 
-
-
-
-
+// Lightweight text lookup for ChatGPT/Codex. Full ElementText reads many AX
+// attributes and frequent traversal of a large Electron tree can briefly slow
+// the application. A small set of useful attributes is enough for Stop buttons.
 static NSString *OpenAIElementText(AXUIElementRef element) {
     NSArray *attributes = @[
         (NSString *)kAXTitleAttribute,
@@ -699,8 +703,8 @@ static NSString *SafariAddressFieldText(AXUIElementRef element) {
 }
 
 static void AddPreferredChildren(NSMutableArray *queue, AXUIElementRef element) {
-
-
+    // Do not add AXChildren, AXVisibleChildren, and AXContents simultaneously:
+    // Safari and Finder would duplicate most of the tree and stall the monitor.
     NSArray *attributes = @[@"AXVisibleChildren", (NSString *)kAXChildrenAttribute, @"AXContents"];
     for (NSString *attribute in attributes) {
         id children = AXCopyValue(element, (CFStringRef)attribute);
@@ -789,8 +793,8 @@ static NSDictionary *FindSafariChatContext(AXUIElementRef root, NSArray *chatPat
 }
 
 
-
-
+// Trash directory fingerprints are used only to confirm actual deletion.
+// Merely displaying a confirmation window is not considered an emptying event.
 static NSString *TrashFingerprint(void) {
     NSMutableSet *paths = [NSMutableSet set];
     NSString *homeTrash = [NSHomeDirectory() stringByAppendingPathComponent:@".Trash"];
@@ -951,7 +955,7 @@ static NSDictionary *ScanSafariDownloadFiles(NSTimeInterval nowEpoch) {
             && nowEpoch - SafariDownloadFileLastScanAt < 0.45) {
         return @{ @"active": @(SafariDownloadFileCachedActive),
                   @"count": @(SafariDownloadFileCachedCount),
-                  @"diag": SafariDownloadFileCachedDiagnostic ?: @"waiting for Safari file check" };
+                  @"diag": SafariDownloadFileCachedDiagnostic ?: @"waiting for the Safari file scan" };
     }
     SafariDownloadFileLastScanAt = nowEpoch;
 
@@ -959,6 +963,18 @@ static NSDictionary *ScanSafariDownloadFiles(NSTimeInterval nowEpoch) {
     NSUInteger count = 0;
     NSMutableArray *examples = [NSMutableArray array];
     NSMutableArray *errors = [NSMutableArray array];
+    NSArray *defaultDownloads = NSSearchPathForDirectoriesInDomains(
+        NSDownloadsDirectory,
+        NSUserDomainMask,
+        YES
+    );
+    NSString *primaryDownloads = [defaultDownloads firstObject];
+    NSError *permissionError = nil;
+    NSArray *permissionItems = primaryDownloads != nil
+        ? [fm contentsOfDirectoryAtPath:primaryDownloads error:&permissionError]
+        : nil;
+    DownloadsAccessChecked = primaryDownloads != nil;
+    DownloadsAccessGranted = permissionItems != nil;
 
     for (NSString *directory in SafariDownloadDirectories()) {
         NSError *error = nil;
@@ -982,6 +998,7 @@ static NSDictionary *ScanSafariDownloadFiles(NSTimeInterval nowEpoch) {
         }
     }
 
+
     SafariDownloadFileCachedActive = count > 0;
     SafariDownloadFileCachedCount = count;
     NSString *diag = nil;
@@ -989,10 +1006,10 @@ static NSDictionary *ScanSafariDownloadFiles(NSTimeInterval nowEpoch) {
         diag = [NSString stringWithFormat:@"file downloads=%lu, marker=%@",
             (unsigned long)count, [examples componentsJoinedByString:@", "]];
     } else if ([errors count] > 0) {
-        diag = [NSString stringWithFormat:@"file downloads not found; access=%@",
+        diag = [NSString stringWithFormat:@"no file downloads found; access=%@",
             [errors componentsJoinedByString:@","]];
     } else {
-        diag = @"Safari file downloads not found";
+        diag = @"no Safari file downloads found";
     }
     [SafariDownloadFileCachedDiagnostic release];
     SafariDownloadFileCachedDiagnostic = [diag copy];
@@ -1118,10 +1135,10 @@ static NSDictionary *ScanSafariDownloadHistory(NSTimeInterval nowEpoch) {
         diag = [NSString stringWithFormat:@"history=%lu, marker=%@",
             (unsigned long)count, [examples componentsJoinedByString:@", "]];
     } else if ([errors count] > 0) {
-        diag = [NSString stringWithFormat:@"history unavailable: %@",
+        diag = [NSString stringWithFormat:@"download history unavailable: %@",
             [errors componentsJoinedByString:@","]];
     } else {
-        diag = @"history did not report active downloads";
+        diag = @"download history contains no active downloads";
     }
     return @{ @"active": @(count > 0), @"count": @(count), @"diag": diag };
 }
@@ -1157,7 +1174,7 @@ static NSDictionary *ScanSafari(pid_t pid) {
             @"busy": @NO,
             @"downloadActive": @NO,
             @"downloadCount": @0,
-            @"downloadDiag": @"Safari UI skipped: tab is not ChatGPT",
+            @"downloadDiag": @"Safari UI skipped: the tab is not ChatGPT",
             @"diag": diag
         };
     }
@@ -1197,9 +1214,8 @@ static NSDictionary *ScanSafari(pid_t pid) {
             || [role isEqualToString:@"AXLink"];
         NSString *text = possibleControl ? OpenAIElementText(element) : @"";
 
-
-
-
+        // Treat only a visible and enabled Stop button as a busy response.
+        // Generic AXBusy state or static "thinking" text causes false positives.
         id enabledValue = AXCopyValue(element, kAXEnabledAttribute);
         BOOL enabled = enabledValue == nil || Truthy(enabledValue);
         BOOL explicitStopIdentifier =
@@ -1410,7 +1426,7 @@ static NSDictionary *ScanAppStoreProcesses(NSTimeInterval nowEpoch, BOOL appStor
     if (count <= 0) {
         AppStoreCachedProcessActive = nowEpoch - AppStoreLastIOAt < 12.0;
         [AppStoreCachedProcessDiagnostic release];
-        AppStoreCachedProcessDiagnostic = [@"proc_listallpids unavailable" copy];
+        AppStoreCachedProcessDiagnostic = [@"proc_listallpids is unavailable" copy];
         return @{ @"active": @(AppStoreCachedProcessActive), @"diag": AppStoreCachedProcessDiagnostic };
     }
 
@@ -1627,8 +1643,8 @@ static NSDictionary *ScanFinder(void) {
                 }
             }
 
-
-
+            // A confirmation window does not trigger flashes by itself. Record
+            // only the presence of the actual confirmation button here.
             if (buttonRole && ContainsPattern(textValue, trashConfirmButtonPatterns)) {
                 trashPromptActive = YES;
                 if ([trashPromptMatched length] == 0) {
@@ -1637,7 +1653,7 @@ static NSDictionary *ScanFinder(void) {
                 }
             }
 
-
+            // This is the actual emptying operation after confirmation.
             if (!menuRole && !buttonRole && ContainsPattern(textValue, trashProgressPatterns)) {
                 trashProgressActive = YES;
                 if ([trashProgressMatched length] == 0) {
@@ -1697,11 +1713,6 @@ static void UpdateBluetoothConnectionEvents(NSTimeInterval nowEpoch) {
         if (device == nil || ![device isConnected]) continue;
 
         NSString *name = [device name] ?: @"Bluetooth device";
-        NSString *lowerName = [name lowercaseString];
-
-        if ([lowerName rangeOfString:@"applemac-led"].location != NSNotFound) {
-            continue;
-        }
 
         NSString *identity = [device addressString];
         if ([identity length] == 0) identity = name;
@@ -1753,6 +1764,13 @@ static void WriteNativeState(void) {
     static NSTimeInterval nextFinderScanAt = 0.0;
     static NSDictionary *cachedFinder = nil;
 
+    if (PermissionStageIs(@"bluetooth") && PermissionBluetoothManager == nil) {
+        PermissionBluetoothManager = [[CBCentralManager alloc]
+            initWithDelegate:nil
+            queue:dispatch_get_main_queue()
+            options:nil];
+    }
+
     BOOL trusted = AXIsProcessTrusted();
     NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
     NSString *frontBundle = [front bundleIdentifier] ?: @"";
@@ -1779,31 +1797,31 @@ static void WriteNativeState(void) {
     }
     NSDictionary *finder = trusted
         ? (cachedFinder ?: @{ @"active": @NO, @"trashPromptActive": @NO,
-            @"trashProgressActive": @NO, @"diag": @"Finder is waiting for a check" })
+            @"trashProgressActive": @NO, @"diag": @"Finder is waiting for a scan" })
         : @{ @"active": @NO, @"trashPromptActive": @NO,
-            @"trashProgressActive": @NO, @"diag": @"Accessibility permission is missing" };
+            @"trashProgressActive": @NO, @"diag": @"Accessibility permission is not granted" };
 
     BOOL trashPromptActive = [finder[@"trashPromptActive"] boolValue];
     BOOL trashProgressActive = [finder[@"trashProgressActive"] boolValue];
     NSString *currentTrashFingerprint = TrashFingerprint();
 
-
-
+    // When the window appears, remember the Trash state only. Do not flash
+    // before actual deletion is confirmed.
     if (trashPromptActive && !previousTrashPromptActive) {
         [trashFingerprintBefore release];
         trashFingerprintBefore = [currentTrashFingerprint copy];
         trashVerificationPending = NO;
     }
 
-
-
+    // After the window closes, check for a Trash change for several seconds.
+    // Cancel leaves the fingerprint unchanged and does not trigger an effect.
     if (!trashPromptActive && previousTrashPromptActive) {
         trashVerificationPending = YES;
         trashVerificationDeadline = nowEpoch + 3.0;
     }
 
-
-
+    // Finder shows a separate progress operation for large deletions. This is
+    // the fastest and most direct confirmation of actual emptying.
     if (trashProgressActive && !previousTrashProgressActive
             && nowEpoch - lastTrashEventAt >= 2.0) {
         trashEventCounter++;
@@ -1813,8 +1831,8 @@ static void WriteNativeState(void) {
         trashFingerprintBefore = nil;
     }
 
-
-
+    // A small deletion can finish without a visible progress window. Confirm it
+    // from changes to the Trash directory metadata instead.
     if (trashVerificationPending) {
         BOOL fingerprintAvailable = ![currentTrashFingerprint isEqualToString:@"unavailable"]
             && trashFingerprintBefore != nil
@@ -1829,7 +1847,7 @@ static void WriteNativeState(void) {
             [trashFingerprintBefore release];
             trashFingerprintBefore = nil;
         } else if (nowEpoch >= trashVerificationDeadline) {
-
+            // The window was cancelled or deletion did not start.
             trashVerificationPending = NO;
             [trashFingerprintBefore release];
             trashFingerprintBefore = nil;
@@ -1839,10 +1857,9 @@ static void WriteNativeState(void) {
     previousTrashPromptActive = trashPromptActive;
     previousTrashProgressActive = trashProgressActive;
 
-
-
-
-
+    // Keep checking Safari in the background until a previously detected Stop
+    // button disappears. When idle, a slower background scan also catches a
+    // quick switch away from Safari immediately after starting a response.
     NSRunningApplication *safariApp = nil;
     BOOL safariForeground = IsSafariApplication(front);
     if (safariForeground) {
@@ -1874,8 +1891,8 @@ static void WriteNativeState(void) {
             safari = @{ @"tab": @NO, @"busy": @NO,
                 @"downloadActive": @(cachedSafariDownloadActive),
                 @"downloadCount": @(cachedSafariDownloadCount),
-                @"downloadDiag": cachedSafariDownloadDiagnostic ?: @"Safari is in the background; waiting for the next check",
-                @"diag": @"Safari is in the background; waiting for the next control check" };
+                @"downloadDiag": cachedSafariDownloadDiagnostic ?: @"Safari is in the background; waiting for the next scan",
+                @"diag": @"Safari is in the background; waiting for the next control scan" };
         }
     } else if (safariApp == nil) {
         cachedSafariDownloadActive = NO;
@@ -1884,9 +1901,9 @@ static void WriteNativeState(void) {
         cachedSafariDownloadDiagnostic = nil;
     }
 
-
-
-
+    // ChatGPT/Codex needs only the presence of its main process. No AXUIElement
+    // is created and its UI is not traversed; the Python agent determines busy
+    // state from task_started and task_complete lifecycle events.
     BOOL openAIForeground = IsOpenAIApplication(front)
         && !IsOpenAIHelperApplication(front);
     NSRunningApplication *openAIUIApp = nil;
@@ -1904,11 +1921,16 @@ static void WriteNativeState(void) {
         ? ([openAIUIApp localizedName] ?: @"ChatGPT")
         : @"";
     NSString *openAIDiagnostic = openAIActive
-        ? @"ChatGPT/Codex found; AX is disabled and activity is determined by lifecycle"
-        : @"ChatGPT/Codex application is not running";
+        ? @"ChatGPT/Codex found; AX is disabled and activity uses lifecycle markers"
+        : @"the ChatGPT/Codex application is not running";
 
-    NSDictionary *safariFiles = ScanSafariDownloadFiles(nowEpoch);
-    NSDictionary *safariHistory = ScanSafariDownloadHistory(nowEpoch);
+    BOOL downloadsEnabled = PermissionStageIs(@"downloads");
+    NSDictionary *safariFiles = downloadsEnabled
+        ? ScanSafariDownloadFiles(nowEpoch)
+        : @{ @"active": @NO, @"count": @0, @"diag": @"Downloads scan is paused during permission setup" };
+    NSDictionary *safariHistory = downloadsEnabled
+        ? ScanSafariDownloadHistory(nowEpoch)
+        : @{ @"active": @NO, @"count": @0, @"diag": @"Download history scan is paused during permission setup" };
     BOOL safariUIActive = [safari[@"downloadActive"] boolValue];
     BOOL safariFileActive = [safariFiles[@"active"] boolValue];
     BOOL safariHistoryActive = [safariHistory[@"active"] boolValue];
@@ -1948,7 +1970,7 @@ static void WriteNativeState(void) {
     }
     NSDictionary *appStoreUI = cachedAppStoreUI
         ?: @{ @"active": @NO, @"count": @0,
-              @"diag": appStoreApp != nil ? @"App Store UI is waiting for a check" : @"App Store is not running" };
+              @"diag": appStoreApp != nil ? @"App Store UI is waiting for a scan" : @"App Store is not running" };
     BOOL appStoreDownloadActive = [appStoreUI[@"active"] boolValue]
         || [appStoreProcess[@"active"] boolValue];
     NSString *appStoreDiagnostic = [NSString stringWithFormat:@"%@; %@",
@@ -1956,7 +1978,12 @@ static void WriteNativeState(void) {
 
     NSDictionary *state = @{
         @"updatedAt": @(nowEpoch),
+        @"permissionStage": PermissionStage,
         @"axTrusted": @(trusted),
+        @"downloadsAccessChecked": @(DownloadsAccessChecked),
+        @"downloadsAccessGranted": @(DownloadsAccessGranted),
+        @"screenCaptureGranted": @(CGPreflightScreenCaptureAccess()),
+        @"bluetoothGranted": @([CBManager authorization] == CBManagerAuthorizationAllowedAlways),
         @"frontBundle": frontBundle,
         @"frontName": frontName,
         @"bluetoothEventCounter": @(BluetoothConnectEventCounter),
@@ -1990,16 +2017,25 @@ static void WriteNativeState(void) {
         [json writeToFile:StatePath options:NSDataWritingAtomic error:&error];
     }
 
-    UpdateBluetoothConnectionEvents(nowEpoch);
+    if (PermissionStageIs(@"bluetooth")) {
+        UpdateBluetoothConnectionEvents(nowEpoch);
+    }
 }
 
 
 int main(void) {
     @autoreleasepool {
+        const char *permissionStage = getenv("APPLEMACLED_PERMISSION_STAGE");
+        if (permissionStage != NULL && permissionStage[0] != '\0') {
+            PermissionStage = [NSString stringWithUTF8String:permissionStage] ?: @"ready";
+        }
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
-        NSDictionary *options = @{ (NSString *)kAXTrustedCheckOptionPrompt: @NO };
+        NSDictionary *options = @{
+            (NSString *)kAXTrustedCheckOptionPrompt:
+                @(PermissionStageIs(@"accessibility"))
+        };
         AXIsProcessTrustedWithOptions((CFDictionaryRef)options);
 
         const char *runner = "$RUN_AGENT";
@@ -2032,7 +2068,9 @@ int main(void) {
                 alarm(0);
                 nextScan = now + 0.50;
             }
-            @autoreleasepool { EnsureAudioMeterStarted(); }
+            if (PermissionStageIs(@"audio")) {
+                @autoreleasepool { EnsureAudioMeterStarted(); }
+            }
 
             [[NSRunLoop currentRunLoop]
                 runMode:NSDefaultRunLoopMode
@@ -2051,13 +2089,14 @@ SRC
   -framework Cocoa \
   -framework ApplicationServices \
   -framework IOBluetooth \
+  -framework CoreBluetooth \
   -framework ScreenCaptureKit \
   -framework CoreMedia \
   -framework AudioToolbox \
   "$SOURCE_FILE" -o "$APP_EXECUTABLE"
 rm -f "$SOURCE_FILE"
 chmod +x "$APP_EXECUTABLE"
-echo "36.14-lighting" > "$LAUNCHER_MARKER"
+echo "public-1.0-permission-stages" > "$LAUNCHER_MARKER"
 
 cat > "$LAUNCH_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2097,41 +2136,11 @@ plutil -lint "$LAUNCH_PLIST" >/dev/null
 
 if ! /usr/bin/codesign -d -r- "$APP_BUNDLE" 2>&1 \
   | /usr/bin/grep -Fq 'designated => identifier "com.applemacled.agent"'; then
-  echo "Error: the application does not have a stable code-signing identity."
+  echo "Error: the application does not have the expected stable code-signing identity."
   exit 1
 fi
 
 touch "$LOG_DIR/launcher.log" "$LOG_DIR/launcher-error.log" "$LOG_DIR/agent.log" "$LOG_DIR/agent-error.log"
 
-
-
-
-launchctl bootstrap "gui/$UID_VALUE" "$LAUNCH_PLIST"
-launchctl kickstart -k "gui/$UID_VALUE/$LABEL"
-
-sleep 2
-open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" >/dev/null 2>&1 || true
-
 echo
-echo "Done. The native AppleMACLED Agent application is installed."
-echo
-echo "IMPORTANT: enable AppleMACLED Agent in:"
-echo "  Privacy & Security → Accessibility"
-echo
-echo "Finder/Safari Automation and Input Monitoring are not required by this version."
-echo "ChatGPT/Codex does not use Accessibility; only task lifecycle is used."
-echo "For the Safari file indicator, macOS may request access to the Downloads folder."
-echo "For music mode, macOS may request Screen Recording/system audio permission."
-echo
-echo "After enabling Accessibility, restart the agent:"
-echo "  launchctl kickstart -k \"gui/$(id -u)/com.applemacled.agent\""
-echo
-echo "Main log:"
-echo "  tail -f \"$LOG_DIR/agent.log\""
-echo
-echo "Native state:"
-echo "  cat \"$NATIVE_STATE\""
-echo
-echo "Audio state:"
-echo "  cat \"$NATIVE_AUDIO_STATE\""
-echo
+echo "Native AppleMACLED Agent public 1.0 was built and signed successfully."
