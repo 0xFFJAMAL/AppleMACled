@@ -9,7 +9,7 @@ music-reactive overlay.
 The ESP32-S3 firmware does not use Wi-Fi or Bluetooth. All Mac-to-ESP
 communication is local USB Serial.
 
-## Public project contents
+## Project contents
 
 ```text
 AppleMACled.ino     ESP32-S3 LED firmware
@@ -356,7 +356,7 @@ permission stage when prompted.
   and applies a local ad-hoc signature; it does not download a prebuilt agent.
 - The agent reads local macOS state only for the lighting behaviors documented
   above.
-- Review source code before installing any software from a public repository.
+- Review the source code before installing software from this repository.
 
 ## Customization
 
