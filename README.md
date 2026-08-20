@@ -18,16 +18,13 @@ MacAgent/           macOS agent, installer, uninstaller, and diagnostics
 README.md           Installation and wiring guide
 ```
 
-No secondary controller firmware is required. This public version deliberately
-excludes clock correction, temperature and fan reporting, network provisioning,
-and macOS media-key control.
-
 Lighting events include:
 
 - normal slow color pulsing;
 - Finder copy and AirDrop activity;
 - Safari download activity;
 - App Store download/update activity;
+- Arduino IDE compilation and firmware-upload activity;
 - ChatGPT and Codex activity;
 - Trash emptying notification;
 - Wi-Fi and Bluetooth connection notification;
@@ -134,7 +131,7 @@ Do not combine an 8 MB partition scheme with Flash Size set to 4 MB. That
 mismatch prevents the ESP32-S3 from booting and produces errors such as
 `partition ... exceeds flash chip size 0x400000`.
 
-Enable `Erase All Flash Before Sketch Upload` for the first public-firmware
+Enable `Erase All Flash Before Sketch Upload` for the first firmware
 upload and whenever changing the Flash Size or Partition Scheme. It can be
 disabled again after the new partition table has been installed successfully.
 
@@ -198,7 +195,7 @@ Install Command Line Tools if needed:
 xcode-select --install
 ```
 
-Then open Terminal in the public project and run:
+Then open Terminal in the project and run:
 
 ```bash
 cd /path/to/AppleMACled/MacAgent
@@ -355,7 +352,6 @@ permission stage when prompted.
 
 - The Mac-to-ESP link is local USB Serial.
 - The ESP32-S3 firmware does not connect to a Wi-Fi network.
-- The repository contains no Wi-Fi password, API key, or account credential.
 - The installer builds the native application locally from the included source
   and applies a local ad-hoc signature; it does not download a prebuilt agent.
 - The agent reads local macOS state only for the lighting behaviors documented
