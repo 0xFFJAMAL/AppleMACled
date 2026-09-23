@@ -63,7 +63,7 @@ cat > "$RUN_AGENT" <<AGENT
 export PYTHONUNBUFFERED=1
 exec "$APP_SUPPORT/send_usb_to_esp.command" daemon \
   --interval 15 \
-  --copy-poll-interval 0.10 \
+  --copy-poll-interval 0.20 \
   >> "$LOG_DIR/agent.log" \
   2>> "$LOG_DIR/agent-error.log"
 AGENT
@@ -414,17 +414,23 @@ static void WriteAudioState(BOOL active, double level, double peak, BOOL beat, N
 
         const uint8_t *data = (const uint8_t *)audioBuffer.mData;
         const UInt32 samplesInBuffer = audioBuffer.mDataByteSize / bytesPerSample;
-        for (UInt32 sampleIndex = 0; sampleIndex < samplesInBuffer; sampleIndex++) {
-            double sample = [self sampleValueFromBytes:(data + sampleIndex * bytesPerSample)
-                                       bytesPerSample:bytesPerSample
-                                               isFloat:isFloat
-                                              isSigned:isSigned];
-            if (!isfinite(sample)) continue;
-            double absSample = fabs(sample);
-            if (absSample > 1.0) absSample = 1.0;
-            sumSquares += sample * sample;
-            if (absSample > peak) peak = absSample;
-            sampleCount++;
+        const UInt32 channelCount = audioBuffer.mNumberChannels > 0 ? audioBuffer.mNumberChannels : 1;
+        const UInt32 framesInBuffer = samplesInBuffer / channelCount;
+
+        for (UInt32 frameIndex = 0; frameIndex < framesInBuffer; frameIndex += 4) {
+            for (UInt32 channelIndex = 0; channelIndex < channelCount; channelIndex++) {
+                const UInt32 sampleIndex = frameIndex * channelCount + channelIndex;
+                double sample = [self sampleValueFromBytes:(data + sampleIndex * bytesPerSample)
+                                           bytesPerSample:bytesPerSample
+                                                   isFloat:isFloat
+                                                  isSigned:isSigned];
+                if (!isfinite(sample)) continue;
+                double absSample = fabs(sample);
+                if (absSample > 1.0) absSample = 1.0;
+                sumSquares += sample * sample;
+                if (absSample > peak) peak = absSample;
+                sampleCount++;
+            }
         }
     }
 
@@ -464,7 +470,8 @@ static void WriteAudioState(BOOL active, double level, double peak, BOOL beat, N
         _lastBeatAt = now;
     }
 
-    if (now - _lastWriteAt >= 0.035 || beat || !active) {
+    NSTimeInterval writeInterval = active ? 0.050 : 0.250;
+    if (beat || now - _lastWriteAt >= writeInterval) {
         _lastWriteAt = now;
         WriteAudioState(
             active,
@@ -2096,7 +2103,7 @@ SRC
   "$SOURCE_FILE" -o "$APP_EXECUTABLE"
 rm -f "$SOURCE_FILE"
 chmod +x "$APP_EXECUTABLE"
-echo "public-1.0-permission-stages" > "$LAUNCHER_MARKER"
+echo "public-1.1-permission-stages" > "$LAUNCHER_MARKER"
 
 cat > "$LAUNCH_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

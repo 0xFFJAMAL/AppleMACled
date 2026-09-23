@@ -153,7 +153,7 @@ chmod +x \
   "$APP_SUPPORT/send_usb_to_esp.command" \
   "$APP_SUPPORT/applemacled.command" \
   "$APP_SUPPORT/audio_watchdog.py"
-echo "public-1.0" > "$VERSION_FILE"
+echo "public-1.1" > "$VERSION_FILE"
 
 echo "Checking the private Python environment before permission setup…"
 (

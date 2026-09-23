@@ -492,7 +492,7 @@ async def audio_serial_loop(provisioner) -> None:
         elif not active and was_active:
             print('Audio: system audio is idle; clearing the music overlay.')
         was_active = active
-        await asyncio.sleep(0.025)
+        await asyncio.sleep(0.025 if active else 0.10)
 
 def audio_serial_thread_main(provisioner) -> None:
     """Run real-time audio outside the monitor/control asyncio event loop."""
@@ -1778,7 +1778,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser('usb-reconnect', help='Close a stale descriptor and rediscover the ESP')
     daemon = subparsers.add_parser('daemon', help='LaunchAgent background mode')
     daemon.add_argument('--interval', type=float, default=15.0)
-    daemon.add_argument('--copy-poll-interval', type=float, default=0.1)
+    daemon.add_argument('--copy-poll-interval', type=float, default=0.20)
     return parser
 
 async def async_main(args: argparse.Namespace) -> int:
@@ -1825,7 +1825,7 @@ async def async_main(args: argparse.Namespace) -> int:
     if args.mode == 'system-blue':
         return await provisioner.system_blue()
     if args.mode == 'daemon':
-        return await daemon_loop(provisioner, health_interval=max(args.interval, 5.0), copy_poll_interval=min(max(args.copy_poll_interval, 0.02), 0.25))
+        return await daemon_loop(provisioner, health_interval=max(args.interval, 5.0), copy_poll_interval=min(max(args.copy_poll_interval, 0.20), 0.25))
     status, _unused = await provisioner.get_status()
     print('Status:', status)
     print('USB port:', provisioner.port_name)
