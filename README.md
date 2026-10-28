@@ -31,6 +31,22 @@ Lighting events include:
 - system-audio-reactive brightness;
 - a smooth fade to black when the agent stops.
 
+## Codex activity detection
+
+Agent 2.0.1 stops the Codex indicator when a task finishes, is interrupted, or
+fails because of a usage limit. Task and thread identifiers keep independent
+chats separate: stopping one task does not hide another running task, and
+resuming work enables the indicator again.
+
+Lifecycle events are the primary source. The agent also checks Codex's local
+`logs_2.sqlite` in read-only mode for final task errors, with bounded query time.
+Usage snapshots and transient prewarm/retry errors do not count as completion.
+If that optional internal log format is unavailable or changes, lifecycle
+tracking continues. Conversation text and raw error messages are not logged.
+
+This update requires reinstalling the macOS agent only; the RP2040 firmware
+does not need to be reflashed.
+
 ## Lighting previews
 
 <table>

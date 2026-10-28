@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -139,18 +140,18 @@ class CodexSessionActivityMonitor:
     SEARCH_CHUNK_BYTES = 1024 * 1024
     STALE_ACTIVE_SECONDS = 2 * 60 * 60
 
-    def __init__(self, session_dir: Path=CODEX_SESSION_DIR) -> None:
+    def __init__(self, session_dir: Path=CODEX_SESSION_DIR, error_log_path: Optional[Path]=None) -> None:
         self.session_dir = session_dir
+        self.error_log_path = error_log_path or session_dir.parent / 'logs_2.sqlite'
         self.files = {}
         self.next_scan_at = 0.0
         self.was_present = False
         self.was_active = False
 
     @staticmethod
-    def _last_lifecycle_marker(data: bytes) -> Optional[bool]:
-        marker: Optional[bool] = None
+    def _lifecycle_events(data: bytes):
         for raw_line in data.splitlines():
-            if b'"task_started"' not in raw_line and b'"task_complete"' not in raw_line:
+            if not any((marker in raw_line for marker in (b'"task_started"', b'"task_complete"', b'"turn_aborted"'))):
                 continue
             if len(raw_line) > 64 * 1024:
                 continue
@@ -158,19 +159,27 @@ class CodexSessionActivityMonitor:
                 event = json.loads(raw_line.decode('utf-8'))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
-            if event.get('type') != 'event_msg':
+            if not isinstance(event, dict) or event.get('type') != 'event_msg':
                 continue
             payload = event.get('payload')
             event_type = payload.get('type') if isinstance(payload, dict) else ''
-            if event_type == 'task_started':
-                marker = True
-            elif event_type == 'task_complete':
-                marker = False
-        return marker
+            if event_type in {'task_started', 'task_complete', 'turn_aborted'}:
+                turn_id = payload.get('turn_id')
+                yield (event_type, turn_id if isinstance(turn_id, str) else None)
 
-    def _last_lifecycle_marker_in_file(self, path: Path, size: int) -> Optional[bool]:
+    @staticmethod
+    def _apply_lifecycle_events(events, state: dict) -> None:
+        for (event_type, turn_id) in events:
+            if event_type == 'task_started':
+                state['active'] = True
+                state['turn_id'] = turn_id
+            elif not turn_id or not state.get('turn_id') or turn_id == state['turn_id']:
+                state['active'] = False
+
+    def _last_lifecycle_marker_in_file(self, path: Path, size: int) -> dict:
         position = size
         carry = b''
+        events = []
         with path.open('rb') as stream:
             while position > 0:
                 start = max(0, position - self.SEARCH_CHUNK_BYTES)
@@ -187,11 +196,58 @@ class CodexSessionActivityMonitor:
                 else:
                     complete = data
                     carry = b''
-                marker = self._last_lifecycle_marker(complete)
-                if marker is not None:
-                    return marker
+                older_events = list(self._lifecycle_events(complete))
+                events = older_events + events
+                if any((event_type == 'task_started' for (event_type, _turn_id) in older_events)):
+                    break
                 position = start
-        return None
+        state = {'active': False, 'turn_id': None}
+        self._apply_lifecycle_events(events, state)
+        return state
+
+    @staticmethod
+    def _thread_id_in_file(path: Path) -> Optional[str]:
+        with path.open('rb') as stream:
+            raw = stream.readline(64 * 1024 + 1)
+        if len(raw) > 64 * 1024:
+            return None
+        try:
+            event = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(event, dict) or event.get('type') != 'session_meta':
+            return None
+        payload = event.get('payload')
+        thread_id = payload.get('id') if isinstance(payload, dict) else None
+        return thread_id if isinstance(thread_id, str) else None
+
+    def _apply_terminal_errors(self, now_wall: float) -> None:
+        active = [state for state in self.files.values() if state.get('active') and state.get('turn_id') and state.get('thread_id')]
+        if not active or not self.error_log_path.is_file():
+            return
+        connection = None
+        try:
+            connection = sqlite3.connect(self.error_log_path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.05)
+            deadline = time.monotonic() + 0.1
+            connection.set_progress_handler(lambda : int(time.monotonic() >= deadline), 1000)
+            for state in active:
+                rows = connection.execute('SELECT feedback_log_body FROM logs WHERE thread_id=? AND ts>=? AND target=? AND instr(feedback_log_body, ?) > 0 ORDER BY ts DESC,ts_nanos DESC LIMIT 32', (state['thread_id'], now_wall - self.STALE_ACTIVE_SECONDS, 'codex_core::session::turn', 'run_turn: Turn error:'))
+                for (body,) in rows:
+                    if not isinstance(body, str):
+                        continue
+                    (context, _separator, error) = body.partition('run_turn: Turn error:')
+                    turn_ids = re.findall('\\bturn\\.id="?([0-9a-fA-F-]{36})\\b', context)
+                    if state['turn_id'] not in turn_ids:
+                        continue
+                    state['active'] = False
+                    reason = 'usage limit' if 'usage limit' in error.lower() else 'task error'
+                    print('Codex sessions: %s; stopped task removed from the indicator.' % reason)
+                    break
+        except (sqlite3.Error, OSError):
+            pass
+        finally:
+            if connection is not None:
+                connection.close()
 
     def reset(self) -> None:
         self.files.clear()
@@ -202,11 +258,10 @@ class CodexSessionActivityMonitor:
         try:
             stat = path.stat()
             size = int(stat.st_size)
-            active = False
+            lifecycle = {'active': False, 'turn_id': None}
             if now_wall - float(stat.st_mtime) <= self.STARTUP_LOOKBACK_SECONDS:
-                marker = self._last_lifecycle_marker_in_file(path, size)
-                active = marker is True
-            self.files[path] = {'offset': size, 'partial': b'', 'active': active, 'updated_at': float(stat.st_mtime)}
+                lifecycle = self._last_lifecycle_marker_in_file(path, size)
+            self.files[path] = {'offset': size, 'partial': b'', **lifecycle, 'thread_id': self._thread_id_in_file(path) if lifecycle['active'] else None, 'updated_at': float(stat.st_mtime)}
         except (FileNotFoundError, OSError):
             return
 
@@ -229,11 +284,11 @@ class CodexSessionActivityMonitor:
                 complete = combined
                 partial = b''
             else:
-                complete, separator, tail = combined.rpartition(b'\n')
+                (complete, separator, tail) = combined.rpartition(b'\n')
                 partial = tail if separator else combined
-            marker = self._last_lifecycle_marker(complete)
-            if marker is not None:
-                state['active'] = marker
+            self._apply_lifecycle_events(self._lifecycle_events(complete), state)
+            if state.get('active') and (not state.get('thread_id')):
+                state['thread_id'] = self._thread_id_in_file(path)
             state['offset'] = size
             state['partial'] = partial
             state['updated_at'] = float(stat.st_mtime)
@@ -262,6 +317,7 @@ class CodexSessionActivityMonitor:
                     self._update_file(path, state)
             for path in set(self.files) - paths:
                 self.files.pop(path, None)
+            self._apply_terminal_errors(now_wall)
             for state in self.files.values():
                 if state.get('active') and now_wall - float(state.get('updated_at', 0.0)) >= self.STALE_ACTIVE_SECONDS:
                     state['active'] = False
@@ -1195,7 +1251,7 @@ async def send_command_to_running_agent(command: str, **payload) -> Optional[dic
             pass
 
 async def daemon_loop(provisioner: SerialProvisioner, *, health_interval: float, copy_poll_interval: float) -> int:
-    print('AppleMAC-LED agent 2.0 for RP2040 started.')
+    print('AppleMAC-LED agent 2.0.1 for RP2040 started.')
     print('The RP2040 USB link is checked at startup and every %.0f seconds.' % health_interval)
     print('Monitoring Finder, Trash, Safari, App Store, Arduino IDE, ChatGPT/Codex, AirDrop, Bluetooth, Wi-Fi, and system audio.')
     print('Desktop and Documents folder access is not required.')
@@ -1522,7 +1578,7 @@ async def daemon_loop(provisioner: SerialProvisioner, *, health_interval: float,
         if codex_session_started:
             print('Codex sessions: an active task was detected; enabling the indicator regardless of the selected chat.')
         elif codex_session_stopped:
-            print('Codex sessions: all active tasks finished; disabling the app indicator immediately.')
+            print('Codex sessions: all active tasks finished or stopped; disabling the app indicator immediately.')
         safari_chatgpt_scan_incomplete = chatgpt_tab_present and chatgpt_ax_scan_hit_limit(ui_state.safari_diagnostic)
         if ui_fresh:
             chatgpt_last_fresh_at = now
