@@ -147,7 +147,7 @@ cp "$SOURCE_AUDIO_WATCHDOG" "$APP_SUPPORT/audio_watchdog.py"
 chmod +x \
   "$APP_SUPPORT/applemacled.command" \
   "$APP_SUPPORT/audio_watchdog.py"
-echo "2.0.1-rp2040" > "$VERSION_FILE"
+echo "2.0.2-rp2040" > "$VERSION_FILE"
 
 echo "Checking the isolated Python environment before permission setup…"
 (
@@ -157,7 +157,6 @@ echo "Checking the isolated Python environment before permission setup…"
 
 cat > "$LAUNCH_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -186,7 +185,6 @@ PLIST
 
 cat > "$AUDIO_WATCHDOG_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -260,7 +258,7 @@ launchctl kickstart -k "gui/$UID_VALUE/$AUDIO_WATCHDOG_LABEL"
 sleep 3
 
 echo
-echo "AppleMAC-LED agent 2.0.1 for RP2040 is installed."
+echo "AppleMAC-LED agent 2.0.2 for RP2040 is installed."
 echo "All required permissions were reset, requested one at a time, and verified."
 echo "Run ./diagnose.command or follow the log with:"
 echo "  tail -f \"$LOG_DIR/agent.log\""

@@ -47,7 +47,7 @@ echo "Stopping the previous agent…"
 stop_old_agent
 sleep 1
 
-echo "Building AppleMACLED Agent 2.0 for RP2040…"
+echo "Building AppleMACLED Agent 2.0.2 for RP2040…"
 mkdir -p \
   "$APP_SUPPORT" \
   "$APP_BUNDLE/Contents/MacOS" \
@@ -81,7 +81,6 @@ chmod +x "$RUN_AGENT"
 
 cat > "$INFO_PLIST" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key>
@@ -99,9 +98,9 @@ cat > "$INFO_PLIST" <<'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>2.0</string>
+  <string>2.0.2</string>
   <key>CFBundleVersion</key>
-  <string>2.0.0</string>
+  <string>2.0.2</string>
   <key>LSUIElement</key>
   <true/>
 
@@ -152,6 +151,111 @@ static CBCentralManager *PermissionBluetoothManager = nil;
 static BOOL PermissionStageIs(NSString *stage) {
     return [PermissionStage isEqualToString:@"ready"]
         || [PermissionStage isEqualToString:stage];
+}
+
+static BOOL UIScreenLocked = NO;
+static BOOL UIScreensaverActive = NO;
+static BOOL UIDisplayAsleep = NO;
+static BOOL UISessionInactive = NO;
+static BOOL UIWasUnavailable = NO;
+static NSTimeInterval UIResumeAt = 0.0;
+
+static NSString *UIUnavailableReason(void) {
+    CFDictionaryRef sessionRef = CGSessionCopyCurrentDictionary();
+    if (sessionRef == NULL) return @"session-unavailable";
+    NSDictionary *session = (NSDictionary *)sessionRef;
+    id lockValue = session[@"CGSSessionScreenIsLocked"];
+    BOOL locked = lockValue != nil ? [lockValue boolValue] : UIScreenLocked;
+    id onConsole = session[(NSString *)kCGSessionOnConsoleKey];
+    BOOL inactive = onConsole != nil && ![onConsole boolValue];
+    CFRelease(sessionRef);
+    if (locked) return @"screen-locked";
+    if (UIScreensaverActive) return @"screensaver";
+    if (UIDisplayAsleep) return @"display-asleep";
+    if (inactive || UISessionInactive) return @"session-inactive";
+    return nil;
+}
+
+static NSString *UIPollingPauseReason(void) {
+    NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
+    NSString *reason = UIUnavailableReason();
+    if (reason != nil) {
+        UIWasUnavailable = YES;
+        return reason;
+    }
+    if (UIWasUnavailable) {
+        UIWasUnavailable = NO;
+        UIResumeAt = now + 1.0;
+    }
+    return now < UIResumeAt ? @"resume-settle" : nil;
+}
+
+@interface UIScreenObserver : NSObject
+@end
+
+@implementation UIScreenObserver
+- (void)screenLocked:(NSNotification *)note { (void)note; UIScreenLocked = YES; }
+- (void)screenUnlocked:(NSNotification *)note { (void)note; UIScreenLocked = NO; }
+- (void)saverStarted:(NSNotification *)note { (void)note; UIScreensaverActive = YES; }
+- (void)saverStopped:(NSNotification *)note { (void)note; UIScreensaverActive = NO; }
+- (void)displayAsleep:(NSNotification *)note { (void)note; UIDisplayAsleep = YES; }
+- (void)displayAwake:(NSNotification *)note { (void)note; UIDisplayAsleep = NO; }
+- (void)sessionInactive:(NSNotification *)note { (void)note; UISessionInactive = YES; }
+- (void)sessionActive:(NSNotification *)note { (void)note; UISessionInactive = NO; }
+@end
+
+static void InstallUIScreenObservers(void) {
+    static UIScreenObserver *observer = nil;
+    observer = [[UIScreenObserver alloc] init];
+    NSDistributedNotificationCenter *distributed = [NSDistributedNotificationCenter defaultCenter];
+    NSNotificationCenter *workspace = [[NSWorkspace sharedWorkspace] notificationCenter];
+    [distributed addObserver:observer selector:@selector(screenLocked:)
+        name:@"com.apple.screenIsLocked" object:nil
+        suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+    [distributed addObserver:observer selector:@selector(screenUnlocked:)
+        name:@"com.apple.screenIsUnlocked" object:nil
+        suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+    [distributed addObserver:observer selector:@selector(saverStarted:)
+        name:@"com.apple.screensaver.didstart" object:nil
+        suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+    [distributed addObserver:observer selector:@selector(saverStopped:)
+        name:@"com.apple.screensaver.didstop" object:nil
+        suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+    [workspace addObserver:observer selector:@selector(displayAsleep:)
+        name:NSWorkspaceScreensDidSleepNotification object:nil];
+    [workspace addObserver:observer selector:@selector(displayAwake:)
+        name:NSWorkspaceScreensDidWakeNotification object:nil];
+    [workspace addObserver:observer selector:@selector(sessionInactive:)
+        name:NSWorkspaceSessionDidResignActiveNotification object:nil];
+    [workspace addObserver:observer selector:@selector(sessionActive:)
+        name:NSWorkspaceSessionDidBecomeActiveNotification object:nil];
+    for (NSRunningApplication *app in [[NSWorkspace sharedWorkspace] runningApplications]) {
+        if ([[app bundleIdentifier] isEqualToString:@"com.apple.ScreenSaver.Engine"])
+            UIScreensaverActive = YES;
+    }
+}
+
+static NSMutableArray *OpenAIScanQueue = nil;
+static NSMutableSet *OpenAIScanVisited = nil;
+static NSUInteger OpenAIScanIndex = 0;
+static NSUInteger OpenAIScanExamined = 0;
+static NSUInteger OpenAIScanControls = 0;
+static NSUInteger OpenAIScanWindows = 0;
+static pid_t OpenAIScanPid = 0;
+static pid_t OpenAIBridgePid = 0;
+static NSUInteger OpenAIBridgeAttempts = 0;
+static BOOL OpenAIBridgeTreeReady = NO;
+static NSTimeInterval OpenAIBridgeNextAttemptAt = 0.0;
+static AXError OpenAIManualAccessibilityError = kAXErrorSuccess;
+static AXError OpenAIEnhancedUiError = kAXErrorSuccess;
+
+static void ResetOpenAIScan(void) {
+    [OpenAIScanQueue release];
+    OpenAIScanQueue = nil;
+    [OpenAIScanVisited release];
+    OpenAIScanVisited = nil;
+    OpenAIScanIndex = OpenAIScanExamined = OpenAIScanControls = OpenAIScanWindows = 0;
+    OpenAIScanPid = 0;
 }
 
 static uint64_t BluetoothConnectEventCounter = 0;
@@ -649,18 +753,15 @@ static NSString *OpenAIElementText(AXUIElementRef element) {
     NSMutableArray *parts = [NSMutableArray array];
     for (NSString *attribute in attributes) {
         id value = AXCopyValue(element, (CFStringRef)attribute);
-        if ([value isKindOfClass:[NSArray class]]) {
-            for (id item in (NSArray *)value) {
-                NSString *text = StringValue(item);
-                if ([text length] > 0) [parts addObject:text];
-            }
-        } else {
-            NSString *text = StringValue(value);
-            if ([text length] > 0) [parts addObject:text];
+        NSArray *values = [value isKindOfClass:[NSArray class]] ? value : @[value ?: @""];
+        for (id item in values) {
+            NSString *text = [[StringValue(item) lowercaseString]
+                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+            if ([text length] > 0 && ![parts containsObject:text]) [parts addObject:text];
         }
     }
-    return [[[parts componentsJoinedByString:@" "] lowercaseString]
-        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return [parts componentsJoinedByString:@" "];
 }
 
 static NSString *SafariIdentityText(AXUIElementRef element) {
@@ -1291,65 +1392,143 @@ static BOOL IsOpenAIRunningStatusText(NSString *text) {
     return [exactStatuses containsObject:text];
 }
 
+static BOOL IsOpenAIRunningTaskBadge(AXUIElementRef element) {
+    id ancestor = (id)element;
+    BOOL taskButton = NO;
+    BOOL taskList = NO;
+
+    for (NSUInteger depth = 1; depth <= 4; depth++) {
+        ancestor = AXCopyValue((AXUIElementRef)ancestor, kAXParentAttribute);
+        if (ancestor == nil) return NO;
+        NSString *role = StringValue(AXCopyValue((AXUIElementRef)ancestor, kAXRoleAttribute));
+        if (depth <= 2 && [role isEqualToString:(NSString *)kAXButtonRole]) {
+            id enabled = AXCopyValue((AXUIElementRef)ancestor, kAXEnabledAttribute);
+            if (enabled != nil && !Truthy(enabled)) return NO;
+            taskButton = YES;
+        }
+        if ([role isEqualToString:@"AXList"]) {
+            NSString *subrole = StringValue(AXCopyValue((AXUIElementRef)ancestor, kAXSubroleAttribute));
+            taskList = taskButton && [subrole isEqualToString:@"AXContentList"];
+            break;
+        }
+        if (depth >= 2 && !taskButton) return NO;
+    }
+    if (!taskList) return NO;
+    for (NSString *attribute in @[(NSString *)kAXTitleAttribute, (NSString *)kAXDescriptionAttribute]) {
+        NSString *label = [[StringValue(AXCopyValue(element, (CFStringRef)attribute)) lowercaseString]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (IsOpenAIRunningStatusText(label)) return YES;
+    }
+    return NO;
+}
+
+
+
+
+
 static NSDictionary *ScanOpenAI(pid_t pid) {
+    if (UIUnavailableReason() != nil) {
+        ResetOpenAIScan();
+        return @{ @"busy": @NO, @"complete": @NO, @"retryAfter": @1.0,
+            @"diag": @"ChatGPT UI polling paused" };
+    }
+    if (OpenAIScanPid != pid) ResetOpenAIScan();
     AXUIElementRef app = AXUIElementCreateApplication(pid);
-    SetAXTimeout(app, 0.15);
-    AXError manualAccessibilityError = AXUIElementSetAttributeValue(
-        app,
-        CFSTR("AXManualAccessibility"),
-        kCFBooleanTrue
-    );
-    AXError enhancedUiError = AXUIElementSetAttributeValue(
-        app,
-        CFSTR("AXEnhancedUserInterface"),
-        kCFBooleanTrue
-    );
-    id windowsValue = AXCopyValue(app, kAXWindowsAttribute);
-    NSMutableArray *queue = [NSMutableArray array];
-    NSUInteger windowCount = 0;
-    if ([windowsValue isKindOfClass:[NSArray class]]) {
-        windowCount = [(NSArray *)windowsValue count];
-        NSUInteger limit = MIN(windowCount, (NSUInteger)3);
-        for (NSUInteger index = 0; index < limit; index++) {
-            id window = [(NSArray *)windowsValue objectAtIndex:index];
-            if (window != nil) [queue addObject:window];
+    SetAXTimeout(app, 0.08);
+
+
+
+    NSTimeInterval bridgeNow = [[NSProcessInfo processInfo] systemUptime];
+    if (OpenAIBridgePid != pid) {
+        OpenAIBridgePid = pid;
+        OpenAIBridgeAttempts = 0;
+        OpenAIBridgeTreeReady = NO;
+        OpenAIBridgeNextAttemptAt = 0.0;
+        OpenAIManualAccessibilityError = kAXErrorSuccess;
+        OpenAIEnhancedUiError = kAXErrorSuccess;
+    }
+    BOOL transientBridgeFailure =
+        OpenAIManualAccessibilityError == kAXErrorCannotComplete
+        || OpenAIEnhancedUiError == kAXErrorCannotComplete
+        || OpenAIManualAccessibilityError == kAXErrorFailure
+        || OpenAIEnhancedUiError == kAXErrorFailure;
+    if (OpenAIBridgeAttempts == 0
+        || (!OpenAIBridgeTreeReady && transientBridgeFailure && OpenAIBridgeAttempts < 4
+            && bridgeNow >= OpenAIBridgeNextAttemptAt)) {
+        ResetOpenAIScan();
+        OpenAIManualAccessibilityError = AXUIElementSetAttributeValue(
+            app, CFSTR("AXManualAccessibility"), kCFBooleanTrue);
+        OpenAIEnhancedUiError = AXUIElementSetAttributeValue(
+            app, CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
+        OpenAIBridgeAttempts++;
+        OpenAIBridgeNextAttemptAt = bridgeNow + 5.0 * (1UL << (OpenAIBridgeAttempts - 1));
+    }
+    if (OpenAIScanQueue == nil) {
+        OpenAIScanQueue = [[NSMutableArray alloc] init];
+        OpenAIScanVisited = [[NSMutableSet alloc] init];
+        OpenAIScanPid = pid;
+        id windowsValue = AXCopyValue(app, kAXWindowsAttribute);
+
+        if ([windowsValue isKindOfClass:[NSArray class]]) {
+            OpenAIScanWindows = [(NSArray *)windowsValue count];
+            NSUInteger limit = MIN(OpenAIScanWindows, (NSUInteger)3);
+            for (NSUInteger index = 0; index < limit; index++) {
+                id window = [(NSArray *)windowsValue objectAtIndex:index];
+                if (window != nil) [OpenAIScanQueue addObject:window];
+            }
+        }
+        if ([OpenAIScanQueue count] == 0) {
+            id root = AXCopyValue(app, kAXFocusedWindowAttribute);
+            if (root == nil) root = AXCopyValue(app, kAXMainWindowAttribute);
+            if (root != nil) {
+                [OpenAIScanQueue addObject:root];
+                OpenAIScanWindows = 1;
+            }
         }
     }
-    if ([queue count] == 0) {
-        id root = AXCopyValue(app, kAXFocusedWindowAttribute);
-        if (root == nil) root = AXCopyValue(app, kAXMainWindowAttribute);
-        if (root != nil) {
-            [queue addObject:root];
-            windowCount = 1;
-        }
-    }
-    if ([queue count] == 0) {
+    if ([OpenAIScanQueue count] == 0) {
         CFRelease(app);
+        ResetOpenAIScan();
         return @{
             @"busy": @NO,
-            @"diag": [NSString stringWithFormat:@"ChatGPT did not return a window, manual=%d, enhanced=%d",
-                (int)manualAccessibilityError, (int)enhancedUiError]
+            @"complete": @NO,
+            @"retryAfter": @3.0,
+            @"diag": [NSString stringWithFormat:@"ChatGPT did not return a window, manual=%d, enhanced=%d, bridge-attempts=%lu",
+                (int)OpenAIManualAccessibilityError, (int)OpenAIEnhancedUiError,
+                (unsigned long)OpenAIBridgeAttempts]
         };
     }
 
-    NSMutableSet *visited = [NSMutableSet set];
-    NSUInteger index = 0;
-    NSUInteger examined = 0;
-    NSUInteger controlCount = 0;
+    NSMutableArray *queue = OpenAIScanQueue;
+    NSMutableSet *visited = OpenAIScanVisited;
+    NSUInteger index = OpenAIScanIndex;
+    NSUInteger examined = OpenAIScanExamined;
+    NSUInteger controlCount = OpenAIScanControls;
+    NSUInteger windowCount = OpenAIScanWindows;
+
+    NSUInteger sliceElements = 0;
+    NSTimeInterval deadline = [[NSProcessInfo processInfo] systemUptime] + 0.40;
     BOOL busy = NO;
     NSString *matched = @"";
     NSString *matchedKind = @"";
-    while (index < [queue count] && examined < 10000) {
+
+    while (index < [queue count] && examined < 6000 && sliceElements < 600) {
+        if ([[NSProcessInfo processInfo] systemUptime] >= deadline
+                || (sliceElements % 32 == 0 && UIUnavailableReason() != nil)) break;
         AXUIElementRef element = (AXUIElementRef)[queue objectAtIndex:index++];
         NSValue *pointer = [NSValue valueWithPointer:(const void *)element];
         if ([visited containsObject:pointer]) continue;
         [visited addObject:pointer];
         examined++;
+        sliceElements++;
+
         if (Truthy(AXCopyValue(element, CFSTR("AXHidden")))) continue;
 
         NSString *role = StringValue(AXCopyValue(element, kAXRoleAttribute));
+        if ([role isEqualToString:@"AXWebArea"]) OpenAIBridgeTreeReady = YES;
         BOOL button = [role isEqualToString:(NSString *)kAXButtonRole]
             || [role rangeOfString:@"Button"].location != NSNotFound;
+
         NSString *identifier = [[[NSString stringWithFormat:@"%@ %@",
             StringValue(AXCopyValue(element, CFSTR("AXIdentifier"))) ?: @"",
             StringValue(AXCopyValue(element, CFSTR("AXDOMIdentifier"))) ?: @""]
@@ -1374,36 +1553,55 @@ static NSDictionary *ScanOpenAI(pid_t pid) {
                 CFRelease(actionNames);
             }
         }
-        if (button || pressable || explicitStopIdentifier) {
+
+        BOOL runningTaskBadge = ([role isEqualToString:@"AXGroup"]
+                || [role isEqualToString:@"AXGenericElement"])
+            && IsOpenAIRunningTaskBadge(element);
+        if (button || pressable || explicitStopIdentifier || runningTaskBadge) {
             controlCount++;
             id enabledValue = AXCopyValue(element, kAXEnabledAttribute);
             BOOL enabled = enabledValue == nil || Truthy(enabledValue);
-            NSString *text = (button || pressable) ? OpenAIElementText(element) : identifier;
-            BOOL runningStatus = ([role isEqualToString:@"AXGroup"]
+            NSString *text = runningTaskBadge ? @"running" :
+                ((button || pressable) ? OpenAIElementText(element) : identifier);
+            BOOL runningStatus = runningTaskBadge || (([role isEqualToString:@"AXGroup"]
                     || [role isEqualToString:@"AXGenericElement"])
-                && IsOpenAIRunningStatusText(text);
+                && IsOpenAIRunningStatusText(text));
             if (enabled && (IsOpenAIStopText(text) || runningStatus)) {
                 busy = YES;
-                matched = [text length] > 160 ? [text substringToIndex:160] : text;
-                matchedKind = runningStatus ? @"status" : @"stop";
+                OpenAIBridgeTreeReady = YES;
+                matched = runningStatus ? @"running" : @"stop";
+                matchedKind = runningTaskBadge ? @"task-list" : (runningStatus ? @"status" : @"stop");
                 break;
             }
         }
+
+
+
+
         AddPreferredChildren(queue, element);
     }
 
-    BOOL capped = examined >= 10000 && index < [queue count];
+    BOOL capped = examined >= 6000 && index < [queue count];
+    BOOL complete = busy || index >= [queue count];
+    OpenAIScanIndex = index;
+    OpenAIScanExamined = examined;
+    OpenAIScanControls = controlCount;
     NSString *diag = busy
-        ? [NSString stringWithFormat:@"windows=%lu, elements=%lu, controls=%lu, active=%@:%@, manual=%d, enhanced=%d",
+        ? [NSString stringWithFormat:@"windows=%lu, elements=%lu, controls=%lu, active=%@:%@, manual=%d, enhanced=%d, bridge-attempts=%lu",
             (unsigned long)windowCount, (unsigned long)examined,
             (unsigned long)controlCount, matchedKind, matched,
-            (int)manualAccessibilityError, (int)enhancedUiError]
-        : [NSString stringWithFormat:@"windows=%lu, elements=%lu, controls=%lu, active=not-found%@, manual=%d, enhanced=%d",
+            (int)OpenAIManualAccessibilityError, (int)OpenAIEnhancedUiError,
+            (unsigned long)OpenAIBridgeAttempts]
+        : [NSString stringWithFormat:@"windows=%lu, elements=%lu, controls=%lu, active=not-found%@, manual=%d, enhanced=%d, bridge-attempts=%lu",
             (unsigned long)windowCount, (unsigned long)examined,
-            (unsigned long)controlCount, capped ? @", limit=yes" : @"",
-            (int)manualAccessibilityError, (int)enhancedUiError];
+            (unsigned long)controlCount, capped ? @", limit=yes" : (complete ? @"" : @", slice=pending"),
+            (int)OpenAIManualAccessibilityError, (int)OpenAIEnhancedUiError,
+            (unsigned long)OpenAIBridgeAttempts];
+
     CFRelease(app);
-    return @{ @"busy": @(busy), @"diag": diag };
+    if (complete || capped) ResetOpenAIScan();
+    return @{ @"busy": @(busy), @"complete": @(complete),
+        @"retryAfter": capped ? @4.0 : @0.0, @"diag": diag };
 }
 
 static BOOL IsAppStoreApplication(NSRunningApplication *application) {
@@ -1911,6 +2109,8 @@ static void WriteNativeState(void) {
     static NSDictionary *cachedFinder = nil;
     static NSTimeInterval nextOpenAIScanAt = 0.0;
     static NSDictionary *cachedOpenAI = nil;
+    static NSDictionary *cachedSafariUI = nil;
+    static BOOL wasUIPaused = NO;
 
     if (PermissionStageIs(@"bluetooth") && PermissionBluetoothManager == nil) {
         PermissionBluetoothManager = [[CBCentralManager alloc]
@@ -1920,13 +2120,24 @@ static void WriteNativeState(void) {
     }
 
     BOOL trusted = AXIsProcessTrusted();
+    NSString *pauseReason = UIPollingPauseReason();
+    BOOL uiPollingPaused = pauseReason != nil;
+    BOOL uiResumed = wasUIPaused && !uiPollingPaused;
+    wasUIPaused = uiPollingPaused;
+    BOOL canScanUI = trusted && !uiPollingPaused;
+    if (uiPollingPaused || uiResumed) ResetOpenAIScan();
     NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
     NSString *frontBundle = [front bundleIdentifier] ?: @"";
     NSString *frontName = [front localizedName] ?: @"";
     NSTimeInterval nowEpoch = [[NSDate date] timeIntervalSince1970];
 
     BOOL finderForeground = [frontBundle isEqualToString:@"com.apple.finder"];
-    BOOL shouldScanFinder = trusted && (
+    if (uiResumed) {
+        nextFinderScanAt = nextOpenAIScanAt = 0.0;
+        lastSafariBackgroundProbeAt = 0.0;
+        safariFastScanUntil = nowEpoch + 3.0;
+    }
+    BOOL shouldScanFinder = canScanUI && (
         finderForeground
         || previousTrashPromptActive
         || previousTrashProgressActive
@@ -2010,13 +2221,17 @@ static void WriteNativeState(void) {
     }
 
     NSDictionary *safari = @{ @"tab": @NO, @"busy": @NO, @"downloadActive": @NO, @"downloadCount": @0, @"downloadDiag": @"Safari is not running", @"diag": @"Safari is not running" };
-    if (trusted && safariApp != nil) {
+    if (uiPollingPaused && safariApp != nil) {
+        safari = cachedSafariUI ?: safari;
+    } else if (canScanUI && safariApp != nil) {
         NSTimeInterval safariBackgroundInterval =
             (cachedSafariDownloadActive || nowEpoch < safariFastScanUntil) ? 1.25 : 6.0;
         BOOL periodicProbe = nowEpoch - lastSafariBackgroundProbeAt >= safariBackgroundInterval;
         BOOL shouldScan = safariForeground || nowEpoch < safariFastScanUntil || periodicProbe;
         if (shouldScan) {
             safari = ScanSafari((pid_t)[safariApp processIdentifier]);
+            [cachedSafariUI release];
+            cachedSafariUI = [safari retain];
             if (!safariForeground) lastSafariBackgroundProbeAt = nowEpoch;
             if ([safari[@"busy"] boolValue]) safariFastScanUntil = nowEpoch + 3.0;
             cachedSafariDownloadActive = [safari[@"downloadActive"] boolValue];
@@ -2031,6 +2246,8 @@ static void WriteNativeState(void) {
                 @"diag": @"Safari is in the background; waiting for the next control scan" };
         }
     } else if (safariApp == nil) {
+        [cachedSafariUI release];
+        cachedSafariUI = nil;
         cachedSafariDownloadActive = NO;
         cachedSafariDownloadCount = 0;
         [cachedSafariDownloadDiagnostic release];
@@ -2057,11 +2274,15 @@ static void WriteNativeState(void) {
     if (trusted && openAIActive) {
         BOOL cachedBusy = [cachedOpenAI[@"busy"] boolValue];
         NSTimeInterval interval = (openAIForeground || cachedBusy) ? 0.45 : 1.50;
-        if (cachedOpenAI == nil || nowEpoch >= nextOpenAIScanAt) {
+        if (canScanUI && (cachedOpenAI == nil || nowEpoch >= nextOpenAIScanAt)) {
             NSDictionary *freshOpenAI = ScanOpenAI((pid_t)[openAIUIApp processIdentifier]);
+            NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:freshOpenAI];
+            if (![freshOpenAI[@"complete"] boolValue])
+                merged[@"busy"] = cachedOpenAI[@"busy"] ?: @NO;
             [cachedOpenAI release];
-            cachedOpenAI = [freshOpenAI retain];
-            nextOpenAIScanAt = nowEpoch + interval;
+            cachedOpenAI = [merged copy];
+            NSTimeInterval retryAfter = [freshOpenAI[@"retryAfter"] doubleValue];
+            nextOpenAIScanAt = nowEpoch + MAX(interval, retryAfter);
         }
         openAIBusy = [cachedOpenAI[@"busy"] boolValue];
         openAIDiagnostic = cachedOpenAI[@"diag"] ?: @"ChatGPT is waiting for a scan";
@@ -2106,7 +2327,7 @@ static void WriteNativeState(void) {
     }
     NSDictionary *appStoreProcess = ScanAppStoreProcesses(nowEpoch, appStoreApp != nil);
     NSTimeInterval appStoreUIInterval = appStoreForeground ? 0.75 : 1.50;
-    BOOL shouldScanAppStoreUI = trusted && appStoreApp != nil
+    BOOL shouldScanAppStoreUI = canScanUI && appStoreApp != nil
         && (cachedAppStoreUI == nil || nowEpoch - lastAppStoreUIScanAt >= appStoreUIInterval);
     if (shouldScanAppStoreUI) {
         NSDictionary *fresh = ScanAppStoreUI((pid_t)[appStoreApp processIdentifier], nowEpoch);
@@ -2130,6 +2351,8 @@ static void WriteNativeState(void) {
         @"updatedAt": @(nowEpoch),
         @"permissionStage": PermissionStage,
         @"axTrusted": @(trusted),
+        @"uiPollingPaused": @(uiPollingPaused),
+        @"uiPollingPauseReason": pauseReason ?: @"",
         @"downloadsAccessChecked": @(DownloadsAccessChecked),
         @"downloadsAccessGranted": @(DownloadsAccessGranted),
         @"screenCaptureGranted": @(CGPreflightScreenCaptureAccess()),
@@ -2138,14 +2361,14 @@ static void WriteNativeState(void) {
         @"frontName": frontName,
         @"bluetoothEventCounter": @(BluetoothConnectEventCounter),
         @"bluetoothDeviceName": BluetoothLastDeviceName ?: @"",
-        @"finderForeground": @(finderForeground),
+        @"finderForeground": @(finderForeground && !uiPollingPaused),
         @"finderCopyActive": finder[@"active"] ?: @NO,
         @"finderDiagnostic": finder[@"diag"] ?: @"",
         @"trashEventCounter": @(trashEventCounter),
         @"trashPromptActive": @(trashPromptActive),
         @"trashProgressActive": @(trashProgressActive),
         @"trashVerificationPending": @(trashVerificationPending),
-        @"safariForeground": @(safariForeground),
+        @"safariForeground": @(safariForeground && !uiPollingPaused),
         @"safariChatGPTTabActive": safari[@"tab"] ?: @NO,
         @"safariChatGPTBusy": safari[@"busy"] ?: @NO,
         @"safariDownloadActive": @(safariCombinedDownloadActive),
@@ -2154,7 +2377,7 @@ static void WriteNativeState(void) {
         @"safariDiagnostic": safari[@"diag"] ?: @"",
         @"appStoreDownloadActive": @(appStoreDownloadActive),
         @"appStoreDiagnostic": appStoreDiagnostic,
-        @"openAIAppForeground": @(openAIForeground),
+        @"openAIAppForeground": @(openAIForeground && !uiPollingPaused),
         @"openAIAppActive": @(openAIActive),
         @"openAIAppBusy": @(openAIBusy),
         @"openAIAppName": openAIName,
@@ -2181,6 +2404,7 @@ int main(void) {
         }
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        InstallUIScreenObservers();
 
         NSDictionary *options = @{
             (NSString *)kAXTrustedCheckOptionPrompt:
@@ -2246,11 +2470,10 @@ SRC
   "$SOURCE_FILE" -o "$APP_EXECUTABLE"
 rm -f "$SOURCE_FILE"
 chmod +x "$APP_EXECUTABLE"
-echo "2.0-rp2040" > "$LAUNCHER_MARKER"
+echo "2.0.2-rp2040" > "$LAUNCHER_MARKER"
 
 cat > "$LAUNCH_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -2293,4 +2516,4 @@ fi
 touch "$LOG_DIR/launcher.log" "$LOG_DIR/launcher-error.log" "$LOG_DIR/agent.log" "$LOG_DIR/agent-error.log"
 
 echo
-echo "Native AppleMACLED Agent 2.0 for RP2040 was built and signed successfully."
+echo "Native AppleMACLED Agent 2.0.2 for RP2040 was built and signed successfully."

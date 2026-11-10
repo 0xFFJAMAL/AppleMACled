@@ -73,7 +73,6 @@ SOURCE_CONTROLLER_ID_FILE = Path(__file__).resolve().parent.parent / 'AppleMACle
 IPC_SOCKET = APP_DIR / 'agent.sock'
 NATIVE_UI_STATE_FILE = APP_DIR / 'native-ui-state.json'
 NATIVE_AUDIO_STATE_FILE = APP_DIR / 'native-audio-state.json'
-CODEX_SESSION_DIR = Path.home() / '.codex' / 'sessions'
 
 def load_controller_id() -> str:
     configured = os.environ.get('APPLEMACLED_CONTROLLER_ID', '').strip()
@@ -103,6 +102,8 @@ USB_CONTROLLER_ID = load_controller_id()
 @dataclass
 class NativeUIState:
     ax_trusted: bool = False
+    ui_polling_paused: bool = False
+    ui_polling_pause_reason: str = ''
     front_bundle: str = ''
     front_name: str = ''
     bluetooth_event_counter: int = 0
@@ -134,19 +135,80 @@ def chatgpt_ax_scan_hit_limit(diagnostic: str) -> bool:
     match = re.search('\\belements=(\\d+)\\b', diagnostic)
     return bool(match and int(match.group(1)) >= CHATGPT_AX_SCAN_ELEMENT_LIMIT)
 
+class CodexHomeResolver:
+
+    def __init__(self) -> None:
+        self.source = ''
+
+    def resolve(self) -> Optional[Path]:
+        session_home = ''
+        if sys.platform == 'darwin':
+            try:
+                result = subprocess.run(['/bin/launchctl', 'getenv', 'CODEX_HOME'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=0.5, check=False)
+                if result.returncode == 0:
+                    session_home = result.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+        environment_home = os.environ.get('CODEX_HOME', '').strip()
+        if session_home:
+            candidates = [(session_home, 'launchd CODEX_HOME')]
+        elif environment_home:
+            candidates = [(environment_home, 'CODEX_HOME')]
+        else:
+            candidates = [(str(Path.home() / '.codex'), 'default')]
+        for (raw_path, source) in candidates:
+            if not raw_path:
+                continue
+            try:
+                path = Path(raw_path).expanduser()
+                if not path.is_absolute():
+                    continue
+                path = path.resolve()
+                if (path / 'sessions').is_dir():
+                    self.source = source
+                    return path
+            except (OSError, RuntimeError, ValueError):
+                continue
+        self.source = 'unavailable'
+        return None
+
 class CodexSessionActivityMonitor:
     SCAN_INTERVAL_SECONDS = 1.0
     STARTUP_LOOKBACK_SECONDS = 180.0
     SEARCH_CHUNK_BYTES = 1024 * 1024
     STALE_ACTIVE_SECONDS = 2 * 60 * 60
+    HOME_REFRESH_SECONDS = 15.0
 
-    def __init__(self, session_dir: Path=CODEX_SESSION_DIR, error_log_path: Optional[Path]=None) -> None:
+    def __init__(self, session_dir: Optional[Path]=None, error_log_path: Optional[Path]=None) -> None:
         self.session_dir = session_dir
-        self.error_log_path = error_log_path or session_dir.parent / 'logs_2.sqlite'
+        self.error_log_path = error_log_path
+        if session_dir is not None and error_log_path is None:
+            self.error_log_path = session_dir.parent / 'logs_2.sqlite'
+        self.home_resolver = CodexHomeResolver() if session_dir is None else None
+        self.explicit_error_log = error_log_path is not None
+        self.next_home_refresh_at = 0.0
+        self.last_home_source = ''
         self.files = {}
         self.next_scan_at = 0.0
         self.was_present = False
         self.was_active = False
+
+    def _refresh_home(self, now: float) -> None:
+        if self.home_resolver is None or now < self.next_home_refresh_at:
+            return
+        self.next_home_refresh_at = now + self.HOME_REFRESH_SECONDS
+        home = self.home_resolver.resolve()
+        session_dir = home / 'sessions' if home is not None else None
+        if session_dir != self.session_dir:
+            self.session_dir = session_dir
+            if not self.explicit_error_log:
+                self.error_log_path = home / 'logs_2.sqlite' if home is not None else None
+            self.files.clear()
+            self.next_scan_at = 0.0
+        source = self.home_resolver.source
+        if source != self.last_home_source:
+            self.last_home_source = source
+            print('Codex sessions: service home source: %s.' % source)
 
     @staticmethod
     def _lifecycle_events(data: bytes):
@@ -223,7 +285,7 @@ class CodexSessionActivityMonitor:
 
     def _apply_terminal_errors(self, now_wall: float) -> None:
         active = [state for state in self.files.values() if state.get('active') and state.get('turn_id') and state.get('thread_id')]
-        if not active or not self.error_log_path.is_file():
+        if not active or self.error_log_path is None or (not self.error_log_path.is_file()):
             return
         connection = None
         try:
@@ -303,10 +365,11 @@ class CodexSessionActivityMonitor:
             self.was_present = False
             return (False, False, stopped, 0)
         self.was_present = True
+        self._refresh_home(now)
         if now >= self.next_scan_at:
             now_wall = time.time()
             try:
-                paths = set(self.session_dir.glob('*/*/*/rollout-*.jsonl'))
+                paths = set(self.session_dir.glob('*/*/*/rollout-*.jsonl')) if self.session_dir is not None else set()
             except OSError:
                 paths = set()
             for path in paths:
@@ -346,7 +409,7 @@ class NativeUIStateMonitor:
                     raise ValueError('invalid JSON')
                 updated_at = float(payload.get('updatedAt', 0.0) or 0.0)
                 age = max(0.0, time.time() - updated_at) if updated_at else 9999.0
-                state = NativeUIState(ax_trusted=bool(payload.get('axTrusted', False)), front_bundle=str(payload.get('frontBundle', '') or ''), front_name=str(payload.get('frontName', '') or ''), bluetooth_event_counter=int(payload.get('bluetoothEventCounter', 0) or 0), bluetooth_device_name=str(payload.get('bluetoothDeviceName', '') or ''), finder_copy_active=bool(payload.get('finderCopyActive', False)), finder_foreground=bool(payload.get('finderForeground', False)), finder_diagnostic=str(payload.get('finderDiagnostic', '') or ''), trash_event_counter=int(payload.get('trashEventCounter', 0) or 0), chatgpt_tab_active=bool(payload.get('safariChatGPTTabActive', False)), chatgpt_busy=bool(payload.get('safariChatGPTBusy', False)), safari_foreground=bool(payload.get('safariForeground', False)), safari_diagnostic=str(payload.get('safariDiagnostic', '') or ''), safari_download_active=bool(payload.get('safariDownloadActive', False)), safari_download_count=int(payload.get('safariDownloadCount', 0) or 0), safari_download_diagnostic=str(payload.get('safariDownloadDiagnostic', '') or ''), appstore_download_active=bool(payload.get('appStoreDownloadActive', False)), appstore_diagnostic=str(payload.get('appStoreDiagnostic', '') or ''), openai_app_active=bool(payload.get('openAIAppActive', False)), openai_app_busy=bool(payload.get('openAIAppBusy', False)), openai_app_foreground=bool(payload.get('openAIAppForeground', False)), openai_app_name=str(payload.get('openAIAppName', '') or ''), openai_app_diagnostic=str(payload.get('openAIAppDiagnostic', '') or ''), error='' if age <= self.STALE_SECONDS else 'the native UI monitor is stale')
+                state = NativeUIState(ax_trusted=bool(payload.get('axTrusted', False)), ui_polling_paused=bool(payload.get('uiPollingPaused', False)), ui_polling_pause_reason=str(payload.get('uiPollingPauseReason', '') or ''), front_bundle=str(payload.get('frontBundle', '') or ''), front_name=str(payload.get('frontName', '') or ''), bluetooth_event_counter=int(payload.get('bluetoothEventCounter', 0) or 0), bluetooth_device_name=str(payload.get('bluetoothDeviceName', '') or ''), finder_copy_active=bool(payload.get('finderCopyActive', False)), finder_foreground=bool(payload.get('finderForeground', False)), finder_diagnostic=str(payload.get('finderDiagnostic', '') or ''), trash_event_counter=int(payload.get('trashEventCounter', 0) or 0), chatgpt_tab_active=bool(payload.get('safariChatGPTTabActive', False)), chatgpt_busy=bool(payload.get('safariChatGPTBusy', False)), safari_foreground=bool(payload.get('safariForeground', False)), safari_diagnostic=str(payload.get('safariDiagnostic', '') or ''), safari_download_active=bool(payload.get('safariDownloadActive', False)), safari_download_count=int(payload.get('safariDownloadCount', 0) or 0), safari_download_diagnostic=str(payload.get('safariDownloadDiagnostic', '') or ''), appstore_download_active=bool(payload.get('appStoreDownloadActive', False)), appstore_diagnostic=str(payload.get('appStoreDiagnostic', '') or ''), openai_app_active=bool(payload.get('openAIAppActive', False)), openai_app_busy=bool(payload.get('openAIAppBusy', False)), openai_app_foreground=bool(payload.get('openAIAppForeground', False)), openai_app_name=str(payload.get('openAIAppName', '') or ''), openai_app_diagnostic=str(payload.get('openAIAppDiagnostic', '') or ''), error='' if age <= self.STALE_SECONDS else 'the native UI monitor is stale')
                 self.last_good = state
                 self.last_mtime_ns = mtime_ns
             else:
@@ -1251,7 +1314,7 @@ async def send_command_to_running_agent(command: str, **payload) -> Optional[dic
             pass
 
 async def daemon_loop(provisioner: SerialProvisioner, *, health_interval: float, copy_poll_interval: float) -> int:
-    print('AppleMAC-LED agent 2.0.1 for RP2040 started.')
+    print('AppleMAC-LED agent 2.0.2 for RP2040 started.')
     print('The RP2040 USB link is checked at startup and every %.0f seconds.' % health_interval)
     print('Monitoring Finder, Trash, Safari, App Store, Arduino IDE, ChatGPT/Codex, AirDrop, Bluetooth, Wi-Fi, and system audio.')
     print('Desktop and Documents folder access is not required.')
@@ -1570,17 +1633,27 @@ async def daemon_loop(provisioner: SerialProvisioner, *, health_interval: float,
             pending_system_blue_events += 1
             print('Wi-Fi: the Mac connected to %s; queueing the blue system indicator.' % wifi_ssid)
         ui_fresh = not ui_state.error
+        ui_polling_paused = ui_state.ui_polling_paused
         chatgpt_tab_present = ui_state.chatgpt_tab_active and ui_fresh
         openai_app_present = ui_state.openai_app_active and ui_fresh
         raw_safari_busy = ui_state.chatgpt_busy and chatgpt_tab_present
         openai_app_busy = bool(ui_state.openai_app_busy and openai_app_present)
+        if ui_polling_paused:
+            openai_app_busy = openai_app_busy_was_active or ui_state.openai_app_busy
         codex_session_busy, codex_session_started, codex_session_stopped, codex_active_count = await asyncio.to_thread(codex_session_monitor.poll, now=now, present=bool(ui_state.openai_app_active))
         if codex_session_started:
             print('Codex sessions: an active task was detected; enabling the indicator regardless of the selected chat.')
         elif codex_session_stopped:
             print('Codex sessions: all active tasks finished or stopped; disabling the app indicator immediately.')
         safari_chatgpt_scan_incomplete = chatgpt_tab_present and chatgpt_ax_scan_hit_limit(ui_state.safari_diagnostic)
-        if ui_fresh:
+        if ui_polling_paused:
+            chatgpt_last_fresh_at = now
+            chatgpt_false_since = 0.0
+            chatgpt_incomplete_since = 0.0
+            if raw_safari_busy:
+                chatgpt_work_latched = True
+                chatgpt_latched_reason = 'ChatGPT in Safari (UI polling paused)'
+        elif ui_fresh:
             chatgpt_last_fresh_at = now
             if raw_safari_busy:
                 chatgpt_work_latched = True

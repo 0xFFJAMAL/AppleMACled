@@ -1,4 +1,4 @@
-# AppleMAC-LED for RP2040 Zero
+AppleMAC-LED for RP2040 Zero
 
 AppleMAC-LED is a macOS status-light project for the Waveshare RP2040 Zero and
 a WS2812B-compatible LED strip. A background agent detects local system
@@ -33,7 +33,7 @@ Lighting events include:
 
 ## Codex activity detection
 
-Agent 2.0.1 stops the Codex indicator when a task finishes, is interrupted, or
+Agent 2.0.2 stops the Codex indicator when a task finishes, is interrupted, or
 fails because of a usage limit. Task and thread identifiers keep independent
 chats separate: stopping one task does not hide another running task, and
 resuming work enables the indicator again.
@@ -46,6 +46,19 @@ tracking continues. Conversation text and raw error messages are not logged.
 
 This update requires reinstalling the macOS agent only; the RP2040 firmware
 does not need to be reflashed.
+
+The agent resolves CODEX_HOME from the macOS user-session environment or its
+own environment, with ~/.codex as the unconfigured default. Symbolic links
+are supported. The location is rechecked every 15 seconds without restarting
+the agent, so moving service data does not require editing source paths.
+
+ChatGPT activity detection normalizes repeated Stop button labels and tracks
+Running badges inside task-list controls when switching between chats. UI
+scans run in short slices, preserve activity during incomplete scans, and pause
+while the screen is locked, the screensaver is active, or the display sleeps.
+Polling resumes after a short settling period. Accessibility bridge retries
+are bounded and limited to transient startup failures. No conversation text
+is read for task-status matching, and there is no added completion timeout.
 
 ## Lighting previews
 
@@ -272,4 +285,4 @@ Hardware and animation constants such as `LED_PIN`, `LED_COUNT`,
 
 ## License
 
-AppleMAC-LED is released under the [MIT License](LICENSE).
+AppleMAC-LED is released under the MIT License. See LICENSE.
